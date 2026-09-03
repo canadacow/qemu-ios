@@ -76,7 +76,10 @@
 #define KEY_PLUS_DOWN KEY_PLUS
 #define KEY_PLUS_UP   (KEY_PLUS_DOWN | KEY_UP)
 
-const int S5L8900_GPIO_IRQS[5] = { S5L8900_GPIO_G0_IRQ, S5L8900_GPIO_G1_IRQ, S5L8900_GPIO_G2_IRQ, S5L8900_GPIO_G3_IRQ, S5L8900_GPIO_G4_IRQ };
+void ipod_touch_key_event(void *opaque, int keycode);
+
+#define S5L8900_NUM_GPIO_IRQS 5
+extern const int S5L8900_GPIO_IRQS[S5L8900_NUM_GPIO_IRQS];
 
 #define IT2G_CPREG_VAR_NAME(name) cpreg_##name
 #define IT2G_CPREG_VAR_DEF(name) uint64_t IT2G_CPREG_VAR_NAME(name)

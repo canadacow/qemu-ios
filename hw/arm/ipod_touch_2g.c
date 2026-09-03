@@ -181,7 +181,11 @@ static uint32_t s5l8720_usb_hwcfg[] = {
     0x01f08024
 };
 
-static void ipod_touch_key_event(void *opaque, int keycode)
+const int S5L8900_GPIO_IRQS[S5L8900_NUM_GPIO_IRQS] = { S5L8900_GPIO_G0_IRQ, S5L8900_GPIO_G1_IRQ,
+                                   S5L8900_GPIO_G2_IRQ, S5L8900_GPIO_G3_IRQ,
+                                   S5L8900_GPIO_G4_IRQ };
+
+void ipod_touch_key_event(void *opaque, int keycode)
 {
     bool do_irq = false;
     int gpio_group = 0, gpio_selector = 0;
@@ -305,7 +309,9 @@ static void ipod_touch_machine_init(MachineState *machine)
     nms->sysic = (IPodTouchSYSICState *) g_malloc0(sizeof(struct IPodTouchSYSICState));
     memory_region_add_subregion(sysmem, SYSIC_MEM_BASE, &sysic_state->iomem);
     busdev = SYS_BUS_DEVICE(dev);
-    for(int grp = 0; grp < GPIO_NUMINTGROUPS; grp++) {
+    /* S5L8900_GPIO_IRQS only defines 5 groups, while GPIO_NUMINTGROUPS is 7 -
+     * iterating to GPIO_NUMINTGROUPS reads past the end of the array. */
+    for(int grp = 0; grp < S5L8900_NUM_GPIO_IRQS; grp++) {
         sysbus_connect_irq(busdev, grp, s5l8900_get_irq(nms, S5L8900_GPIO_IRQS[grp]));
     }
 

@@ -1,4 +1,9 @@
 #include "hw/arm/ipod_touch_lcd.h"
+#include "hw/arm/ipod_touch_bezel.h"
+#include "hw/arm/ipod_touch_2g.h"
+#include <zlib.h>
+#include "hw/qdev-properties.h"
+#include "qemu/error-report.h"
 #include "ui/pixel_ops.h"
 #include "ui/console.h"
 #include "hw/display/framebuffer.h"
@@ -95,6 +100,80 @@ static void draw_line32_32(void *opaque, uint8_t *d, const uint8_t *s, int width
     } while (-- width != 0);
 }
 
+
+/* ---- bezel (device skin) support ---------------------------------- */
+
+static void bezel_composite(IPodTouchLCDState *lcd)
+{
+    DisplaySurface *surface = qemu_console_surface(lcd->con);
+    uint8_t *dst_base = surface_data(surface);
+    int stride = surface_stride(surface);
+    const uint8_t *src = lcd->bezel_rgba;
+    int x, y;
+
+    if (!src || !dst_base) {
+        return;
+    }
+
+    for (y = 0; y < BEZEL_HEIGHT; y++) {
+        uint8_t *dst = dst_base + y * stride;
+        for (x = 0; x < BEZEL_WIDTH; x++) {
+            const uint8_t *p = src + (y * BEZEL_WIDTH + x) * 4;
+            uint8_t a = p[3];
+            uint8_t *d = dst + x * 4;
+            bool in_screen = (x >= BEZEL_SCREEN_X && x < BEZEL_SCREEN_X + BEZEL_SCREEN_W &&
+                              y >= BEZEL_SCREEN_Y && y < BEZEL_SCREEN_Y + BEZEL_SCREEN_H);
+            if (in_screen) {
+                continue;
+            }
+            /* Blend against BEZEL_BG, never against the existing buffer:
+             * the surface starts uninitialised, so blending with it would
+             * tint the antialiased corners with garbage (white). */
+            if (a == 255) {
+                d[0] = p[2]; d[1] = p[1]; d[2] = p[0];
+            } else if (a == 0) {
+                d[0] = BEZEL_BG_B; d[1] = BEZEL_BG_G; d[2] = BEZEL_BG_R;
+            } else {
+                d[0] = (p[2] * a + BEZEL_BG_B * (255 - a)) / 255;
+                d[1] = (p[1] * a + BEZEL_BG_G * (255 - a)) / 255;
+                d[2] = (p[0] * a + BEZEL_BG_R * (255 - a)) / 255;
+            }
+            d[3] = 0xFF;
+        }
+    }
+    dpy_gfx_update(lcd->con, 0, 0, BEZEL_WIDTH, BEZEL_HEIGHT);
+}
+
+static int bezel_hit_test(int bx, int by)
+{
+    int dx = bx - BEZEL_HOME_CX;
+    int dy = by - BEZEL_HOME_CY;
+    if (dx * dx + dy * dy <= BEZEL_HOME_R * BEZEL_HOME_R) {
+        return BEZEL_BTN_HOME;
+    }
+    if (bx >= BEZEL_VOLUP_X0 && bx <= BEZEL_VOLUP_X1 &&
+        by >= BEZEL_VOLUP_Y0 && by <= BEZEL_VOLUP_Y1) {
+        return BEZEL_BTN_VOLUP;
+    }
+    if (bx >= BEZEL_VOLDN_X0 && bx <= BEZEL_VOLDN_X1 &&
+        by >= BEZEL_VOLDN_Y0 && by <= BEZEL_VOLDN_Y1) {
+        return BEZEL_BTN_VOLDN;
+    }
+    return BEZEL_BTN_NONE;
+}
+
+static void bezel_button_event(IPodTouchLCDState *lcd, int btn, bool down)
+{
+    int code;
+    switch (btn) {
+    case BEZEL_BTN_HOME:  code = down ? KEY_H_DOWN    : KEY_H_UP;    break;
+    case BEZEL_BTN_VOLUP: code = down ? KEY_PLUS_DOWN : KEY_PLUS_UP; break;
+    case BEZEL_BTN_VOLDN: code = down ? KEY_MIN_DOWN  : KEY_MIN_UP;  break;
+    default: return;
+    }
+    ipod_touch_key_event(lcd->mt, code);
+}
+
 static void lcd_refresh(void *opaque)
 {
     // printf("%s: refreshing LCD screen\n", __func__);
@@ -125,16 +204,49 @@ static void lcd_refresh(void *opaque)
         framebuffer_update_memory_section(&lcd->fbsection, lcd->sysmem, lcd->w1_framebuffer_base, height, 4 * width);
     }
 
-    framebuffer_update_display(surface, &lcd->fbsection,
-                               width, height,
-                               src_width,       /* Length of source line, in bytes.  */
-                               linesize,        /* Bytes between adjacent horizontal output pixels.  */
-                               dest_width,      /* Bytes between adjacent vertical output pixels.  */
-                               lcd->invalidate,
-                               draw_line, NULL,
-                               &first, &last);
-    if (first >= 0) {
-        dpy_gfx_update(lcd->con, 0, first, width, last - first + 1);
+    if (lcd->bezel_enabled) {
+        /* Paint the static bezel once (and after any full invalidate). */
+        if (!lcd->bezel_drawn) {
+            bezel_composite(lcd);
+            lcd->bezel_drawn = true;
+        }
+        /* Render the 320x480 framebuffer into a scratch surface, then blit it
+         * into the screen cut-out. framebuffer_update_display() always writes
+         * at the surface origin, so it cannot target a sub-rectangle. */
+        framebuffer_update_display(lcd->fb_surface, &lcd->fbsection,
+                                   width, height,
+                                   src_width,
+                                   surface_stride(lcd->fb_surface),
+                                   dest_width,
+                                   lcd->invalidate,
+                                   draw_line, NULL,
+                                   &first, &last);
+        if (first >= 0) {
+            uint8_t *dst_base = surface_data(surface);
+            uint8_t *src_base = surface_data(lcd->fb_surface);
+            int dst_stride = surface_stride(surface);
+            int src_stride = surface_stride(lcd->fb_surface);
+            int row;
+            for (row = first; row <= last; row++) {
+                memcpy(dst_base + (BEZEL_SCREEN_Y + row) * dst_stride + BEZEL_SCREEN_X * 4,
+                       src_base + row * src_stride,
+                       width * 4);
+            }
+            dpy_gfx_update(lcd->con, BEZEL_SCREEN_X, BEZEL_SCREEN_Y + first,
+                           width, last - first + 1);
+        }
+    } else {
+        framebuffer_update_display(surface, &lcd->fbsection,
+                                   width, height,
+                                   src_width,
+                                   linesize,
+                                   dest_width,
+                                   lcd->invalidate,
+                                   draw_line, NULL,
+                                   &first, &last);
+        if (first >= 0) {
+            dpy_gfx_update(lcd->con, 0, first, width, last - first + 1);
+        }
     }
     lcd->invalidate = 0;
 }
@@ -154,11 +266,39 @@ static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int bu
 {
     // printf("x %d y %d z %d state %d\n", x, y, z, buttons_state);
 
-    // convert x and y to fractional numbers
-    float fx = x / pow(2, 15);
-    float fy = 1 - y / pow(2, 15);
-
     IPodTouchLCDState *lcd = (IPodTouchLCDState *) opaque;
+    float fx, fy;
+
+    if (lcd->bezel_enabled) {
+        /* absolute coords are normalised over the whole (bezel-sized) window */
+        int bx = (int)((x / pow(2, 15)) * BEZEL_WIDTH);
+        int by = (int)((y / pow(2, 15)) * BEZEL_HEIGHT);
+        int hit = bezel_hit_test(bx, by);
+
+        /* release a held bezel button when the mouse comes up or leaves it */
+        if (lcd->bezel_btn_held != BEZEL_BTN_NONE &&
+            (!buttons_state || hit != lcd->bezel_btn_held)) {
+            bezel_button_event(lcd, lcd->bezel_btn_held, false);
+            lcd->bezel_btn_held = BEZEL_BTN_NONE;
+        }
+        if (hit != BEZEL_BTN_NONE) {
+            if (buttons_state && lcd->bezel_btn_held == BEZEL_BTN_NONE) {
+                lcd->bezel_btn_held = hit;
+                bezel_button_event(lcd, hit, true);
+            }
+            return;   /* not a touchscreen event */
+        }
+        /* re-normalise into the screen cut-out */
+        fx = (bx - BEZEL_SCREEN_X) / (float)BEZEL_SCREEN_W;
+        fy = 1 - (by - BEZEL_SCREEN_Y) / (float)BEZEL_SCREEN_H;
+        if (fx < 0 || fx > 1 || fy < 0 || fy > 1) {
+            return;   /* outside the display */
+        }
+    } else {
+        fx = x / pow(2, 15);
+        fy = 1 - y / pow(2, 15);
+    }
+
     lcd->mt->prev_touch_x = lcd->mt->touch_x;
     lcd->mt->prev_touch_y = lcd->mt->touch_y;
     lcd->mt->touch_x = fx;
@@ -184,11 +324,37 @@ static void refresh_timer_tick(void *opaque)
     timer_mod(s->refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 60);//LCD_REFRESH_RATE_FREQUENCY);
 }
 
+
+static Property ipod_touch_lcd_properties[] = {
+    DEFINE_PROP_BOOL("bezel", IPodTouchLCDState, bezel_enabled, true),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
 static void ipod_touch_lcd_realize(DeviceState *dev, Error **errp)
 {
     IPodTouchLCDState *s = IPOD_TOUCH_LCD(dev);
     s->con = graphic_console_init(dev, 0, &gfx_ops, s);
-    qemu_console_resize(s->con, 320, 480);
+
+    s->bezel_btn_held = BEZEL_BTN_NONE;
+    if (s->bezel_enabled) {
+        unsigned long dlen = BEZEL_RGBA_LEN;
+        s->bezel_rgba = g_malloc(BEZEL_RGBA_LEN);
+        if (uncompress(s->bezel_rgba, &dlen, bezel_rgba_z,
+                       BEZEL_RGBA_Z_LEN) != Z_OK || dlen != BEZEL_RGBA_LEN) {
+            warn_report("iPod Touch: failed to decompress bezel image, "
+                        "falling back to plain display");
+            g_free(s->bezel_rgba);
+            s->bezel_rgba = NULL;
+            s->bezel_enabled = false;
+        }
+    }
+
+    if (s->bezel_enabled) {
+        qemu_console_resize(s->con, BEZEL_WIDTH, BEZEL_HEIGHT);
+        s->fb_surface = qemu_create_displaysurface(320, 480);
+    } else {
+        qemu_console_resize(s->con, 320, 480);
+    }
 
     // add mouse handler
     qemu_add_mouse_event_handler(ipod_touch_lcd_mouse_event, s, 1, "iPod Touch Touchscreen");
@@ -214,6 +380,7 @@ static void ipod_touch_lcd_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = ipod_touch_lcd_realize;
+    device_class_set_props(dc, ipod_touch_lcd_properties);
 }
 
 static const TypeInfo ipod_touch_lcd_info = {
