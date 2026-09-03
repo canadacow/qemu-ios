@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_lis302dl.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static int lis302dl_event(I2CSlave *i2c, enum i2c_event event)
 {
@@ -8,7 +9,7 @@ static int lis302dl_event(I2CSlave *i2c, enum i2c_event event)
 static uint8_t lis302dl_recv(I2CSlave *i2c)
 {
     LIS302DLState *s = LIS302DL(i2c);
-    printf("Reading accelerometer register %d\n", s->cmd);
+    // printf("Reading accelerometer register %d\n", s->cmd);
 
     switch(s->cmd) {
         case ACCEL_WHOAMI:

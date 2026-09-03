@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_isl29003dl.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static int isl29003dl_event(I2CSlave *i2c, enum i2c_event event)
 {

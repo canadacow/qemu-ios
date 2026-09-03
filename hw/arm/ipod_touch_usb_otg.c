@@ -21,6 +21,7 @@
 #include "qapi/error.h"
 #include "hw/hw.h"
 #include "hw/arm/ipod_touch_usb_otg.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static inline size_t synopsys_usb_tx_fifo_start(synopsys_usb_state *_state, uint32_t _fifo)
 {

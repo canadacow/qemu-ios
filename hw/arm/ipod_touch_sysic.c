@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_sysic.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
 {

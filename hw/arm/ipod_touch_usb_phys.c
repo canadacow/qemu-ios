@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_usb_phys.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static uint64_t ipod_touch_usb_phys_read(void *opaque, hwaddr addr, unsigned size)
 {

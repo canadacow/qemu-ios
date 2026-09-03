@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_mbx.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static uint32_t reverse_byte_order(uint32_t value) {
     return ((value & 0x000000FF) << 24) |

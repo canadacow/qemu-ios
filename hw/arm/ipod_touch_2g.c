@@ -13,6 +13,7 @@
 #include "hw/arm/ipod_touch_2g.h"
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 #define VMSTATE_IT2G_CPREG(name) \
         VMSTATE_UINT64(IT2G_CPREG_VAR_NAME(name), IPodTouchMachineState)
@@ -147,9 +148,11 @@ static char *ipod_touch_get_nand_path(Object *obj, Error **errp)
 
 static void ipod_touch_set_nand_path(Object *obj, const char *value, Error **errp)
 {
-    gboolean nand_exists = g_file_test(value, G_FILE_TEST_IS_DIR);
+    /* Accept either the per-page directory tree or a flat NAND image file. */
+    gboolean nand_exists = g_file_test(value, G_FILE_TEST_IS_DIR) ||
+                           g_file_test(value, G_FILE_TEST_IS_REGULAR);
     if(!nand_exists) {
-        error_report("NAND at path \"%s\" must be a directory", value);
+        error_report("NAND at path \"%s\" must be a directory or an image file", value);
         exit(1);
     }
     

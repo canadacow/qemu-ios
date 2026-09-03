@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_gpio.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static void s5l8900_gpio_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {

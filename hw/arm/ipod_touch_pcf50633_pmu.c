@@ -1,5 +1,6 @@
 #include "hw/arm/ipod_touch_pcf50633_pmu.h"
 #include "hw/arm/ipod_touch_lcd.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static int pcf50633_event(I2CSlave *i2c, enum i2c_event event)
 {

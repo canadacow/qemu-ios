@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_timer.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static void s5l8900_st_update(IPodTouchTimerState *s)
 {

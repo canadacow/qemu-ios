@@ -5,6 +5,7 @@
  */
 
 #include "hw/arm/ipod_touch_spi.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static int apple_spi_word_size(IPodTouchSPIState *s)
 {

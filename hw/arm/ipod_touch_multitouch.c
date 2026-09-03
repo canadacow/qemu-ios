@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_multitouch.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static void prepare_interface_version_response(IPodTouchMultitouchState *s) {
     memset(s->out_buffer + 1, 0, 15);

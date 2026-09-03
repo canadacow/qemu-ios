@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_aes.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static uint64_t ipod_touch_aes_read(void *opaque, hwaddr offset, unsigned size)
 {

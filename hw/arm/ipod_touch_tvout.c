@@ -1,5 +1,6 @@
 #include "hw/arm/ipod_touch_tvout.h"
 #include "qapi/error.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static uint64_t ipod_touch_tvout_sdo_read(void *opaque, hwaddr offset, unsigned size)
 {

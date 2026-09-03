@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_sha1.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static uint64_t swapLong(uint64_t x) {
     x = (x & 0x00000000FFFFFFFF) << 32 | (x & 0xFFFFFFFF00000000) >> 32;

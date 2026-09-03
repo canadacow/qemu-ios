@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_nor_spi.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static void initialize_nor(IPodTouchNORSPIState *s)
 {

@@ -7,6 +7,7 @@
 #include "ui/pixel_ops.h"
 #include "ui/console.h"
 #include "hw/display/framebuffer.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 int lcd_brightness = 255;
 

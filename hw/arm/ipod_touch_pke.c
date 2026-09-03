@@ -1,6 +1,7 @@
 #include "hw/arm/ipod_touch_pke.h"
 #include <openssl/bn.h>
 #include <openssl/bio.h>
+#include "hw/arm/ipod_touch_debug.h"
 
 static uint8_t *datahex(char* string) {
 

@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_cd3272_mikey.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static int cd3272_mikey_event(I2CSlave *i2c, enum i2c_event event)
 {

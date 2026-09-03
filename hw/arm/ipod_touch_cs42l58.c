@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_cs42l58.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static int cs42l58_event(I2CSlave *i2c, enum i2c_event event)
 {

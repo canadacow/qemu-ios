@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_sdio.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static void trigger_irq(void *opaque)
 {
