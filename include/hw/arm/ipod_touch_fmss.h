@@ -15,6 +15,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchFMSSState, IPOD_TOUCH_FMSS)
 #define NAND_BYTES_PER_PAGE 4096
 #define NAND_BYTES_PER_SPARE 64
 
+/* Flat NAND image support.
+ * The original backing store is one file per page (nand/cs<N>/<page>.page),
+ * which means ~262k tiny files: slow to generate, slow to copy, and very slow
+ * over WSL/network filesystems. A flat image stores the same data as a single
+ * file of fixed-size records, indexed by (cs, page).
+ */
+#define NAND_BYTES_PER_RECORD (NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE)
+#define NAND_PAGES_PER_CS     524288
+#define NAND_NUM_CS           4
+
 #define FMSS__FMCTRL1             0x4
 #define FMSS__CS_IRQ              0xC0C
 #define FMSS__CS_IRQMASK          0xC10
@@ -45,6 +55,8 @@ typedef struct IPodTouchFMSSState
     uint32_t reg_pages_out_addr;
     uint32_t reg_csgenrc;
     char *nand_path;
+    FILE *nand_image;     /* non-NULL when nand_path is a flat image */
+    bool nand_flat_checked;
 } IPodTouchFMSSState;
 
 #endif

@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_fmss.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 uint64_t temp_storage[512];
 
@@ -52,23 +53,54 @@ static void read_nand_pages(IPodTouchFMSSState *s)
         }
 
         // prepare the page
-        char filename[200];
-        sprintf(filename, "%s/cs%d/%d.page", s->nand_path, cs, page_nr);
-        struct stat st = {0};
-        if (stat(filename, &st) == -1) {
+        bool page_present = false;
+
+        /* Open a flat NAND image on first use: if nand_path names a regular
+         * file (rather than the historical cs<N>/<page>.page directory tree),
+         * every page is one fixed-size record inside it. */
+        if (!s->nand_image && !s->nand_flat_checked) {
+            struct stat nst = {0};
+            s->nand_flat_checked = true;
+            if (stat(s->nand_path, &nst) == 0 && S_ISREG(nst.st_mode)) {
+                s->nand_image = fopen(s->nand_path, "rb");
+                if (!s->nand_image) {
+                    hw_error("Unable to open NAND image %s", s->nand_path);
+                }
+            }
+        }
+
+        if (s->nand_image) {
+            /* Flat image: one fixed-size record per (cs, page). */
+            uint64_t off = ((uint64_t)cs * NAND_PAGES_PER_CS + page_nr) *
+                           NAND_BYTES_PER_RECORD;
+            if (fseeko(s->nand_image, (off_t)off, SEEK_SET) == 0 &&
+                fread(s->page_buffer, 1, NAND_BYTES_PER_PAGE, s->nand_image)
+                    == NAND_BYTES_PER_PAGE &&
+                fread(s->page_spare_buffer, 1, NAND_BYTES_PER_SPARE, s->nand_image)
+                    == NAND_BYTES_PER_SPARE) {
+                page_present = true;
+            }
+        } else {
+            char filename[200];
+            sprintf(filename, "%s/cs%d/%d.page", s->nand_path, cs, page_nr);
+            struct stat st = {0};
+            if (stat(filename, &st) != -1) {
+                FILE *f = fopen(filename, "rb");
+                if (f == NULL) { hw_error("Unable to read file!"); }
+                fread(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
+                fread(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
+                fclose(f);
+                page_present = true;
+            }
+        }
+
+        if (!page_present) {
             // page storage does not exist - initialize an empty buffer
             memset(s->page_buffer, 0, NAND_BYTES_PER_PAGE);
             memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
 
             uint32_t *buf_cst = (uint32_t *) s->page_spare_buffer;
             buf_cst[2] = 0x00FF00FF;
-        }
-        else {
-            FILE *f = fopen(filename, "rb");
-            if (f == NULL) { hw_error("Unable to read file!"); }
-            fread(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
-            fread(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
-            fclose(f);
         }
 
         // we write away the page in two parts, 2048 bytes first and then the other 2048 bytes.
