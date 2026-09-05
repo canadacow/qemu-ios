@@ -20,6 +20,10 @@
 static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
                                 uint32_t status, uint32_t flags);
 
+/* The one network this device reports; the scan result and the association
+ * queries both use it, so they tell the same story. */
+static const uint8_t bcm4325_bssid[6] = { 0x02, 0x00, 0x5e, 0x10, 0x00, 0x01 };
+
 /* Value the backplane returns for a 32-bit read at a windowed F1 address.
  *
  * The host identifies the chip from the id at the enumeration base, then walks
@@ -131,12 +135,20 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
     resp->flags  = cdc->flags;      /* carries the request id the host checks */
     resp->status = 0;               /* success */
 
-    /* Note: returning an error for GET_BSSID stops the driver four commands
-     * short of where it otherwise reaches, so the association state is left
-     * reported as success for now. The zeroed BSSID that implies is what leads
-     * configd to present the Ask To Join panel, which SpringBoard sometimes
-     * fails to answer - the spinner. Both halves need a real scan result to
-     * resolve properly. */
+    /* Association queries answer with the network the scan reports, so the
+     * two agree. A zeroed BSSID reads as "associated to nothing", which is
+     * the contradiction that drives configd into the Ask To Join panel. */
+    if (cdc->cmd == CDC_CMD_GET_BSSID && resp->payload_len >= 6) {
+        memcpy(resp->payload, bcm4325_bssid, sizeof(bcm4325_bssid));
+    }
+
+    /* A scan request is answered with results, but not here: queueing an event
+     * straight after the reply puts it in the middle of the command/response
+     * cycle, and the driver reads it where it expects the next reply. Note the
+     * request and deliver it from the idle poll, when nothing is outstanding. */
+    if (cdc->cmd == CDC_CMD_SET_VAR && !strcmp(iovar, "iscan")) {
+        s->scan_pending = true;
+    }
 
     /* The host checks the response's len against the length it sent, so echo
      * that back whatever we actually return. A get carries that many bytes of
@@ -221,8 +233,50 @@ static uint32_t bcm4325_build_control_frame(BCM4325PendingResponse *resp,
 
 /* Queue a firmware event. The driver subscribes to these with event_msgs and
  * waits for them; a link-up event is what tells the stack it is associated. */
+
+/* The one network this device reports. Its BSSID is what the association
+ * queries answer with, so the scan result and the association state tell the
+ * same story - a scan that finds nothing, or a BSSID of all zeros, leaves
+ * configd asking SpringBoard to present the Ask To Join panel. */
+
+static void bcm4325_fill_bss(BCM4325BssInfo *bss)
+{
+    memset(bss, 0, sizeof(*bss));
+    bss->version = BCM4325_BSS_VERSION;
+    bss->length = sizeof(*bss);
+    memcpy(bss->bssid, bcm4325_bssid, sizeof(bcm4325_bssid));
+    bss->beacon_period = 100;
+    bss->capability = 0x0001;          /* ESS, no privacy - an open network */
+    bss->ssid_len = strlen(BCM4325_FAKE_SSID);
+    memcpy(bss->ssid, BCM4325_FAKE_SSID, bss->ssid_len);
+    bss->rateset.count = 4;
+    bss->rateset.rates[0] = 0x82;      /* 1Mbps basic */
+    bss->rateset.rates[1] = 0x84;      /* 2Mbps basic */
+    bss->rateset.rates[2] = 0x8b;      /* 5.5Mbps basic */
+    bss->rateset.rates[3] = 0x96;      /* 11Mbps basic */
+    bss->chanspec = BCM4325_FAKE_CHANNEL;
+    bss->dtim_period = 1;
+    bss->rssi = (uint16_t)(int16_t)-40; /* a strong signal */
+    bss->phy_noise = -90;
+    bss->ctl_ch = 6;
+    bss->ie_offset = sizeof(*bss);
+    bss->ie_length = 0;
+    bss->snr = 50;
+}
+
+static void bcm4325_queue_event_data(IPodTouchSDIOState *s, uint32_t event_type,
+                                     uint32_t status, uint32_t flags,
+                                     const void *data, uint32_t datalen);
+
 static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
                                 uint32_t status, uint32_t flags)
+{
+    bcm4325_queue_event_data(s, event_type, status, flags, NULL, 0);
+}
+
+static void bcm4325_queue_event_data(IPodTouchSDIOState *s, uint32_t event_type,
+                                     uint32_t status, uint32_t flags,
+                                     const void *data, uint32_t datalen)
 {
     BCM4325PendingResponse *resp = g_malloc0(sizeof(*resp));
     const uint8_t *mac = s->conf.macaddr.a;
@@ -248,14 +302,19 @@ static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
     ev->status      = cpu_to_be32(status);
     ev->reason      = 0;
     ev->auth_type   = 0;
-    ev->datalen     = 0;
     memcpy(ev->addr, mac, 6);
     g_strlcpy(ev->ifname, "eth0", sizeof(ev->ifname));
     ev->ifidx = 0;
     ev->bsscfgidx = 0;
 
+    ev->datalen = cpu_to_be32(datalen);
     resp->payload_len = sizeof(*ev);
-    SDTRACE("  event type=%u status=%u queued", event_type, status);
+    if (data && datalen && sizeof(*ev) + datalen <= sizeof(resp->payload)) {
+        memcpy(resp->payload + sizeof(*ev), data, datalen);
+        resp->payload_len += datalen;
+    }
+    SDTRACE("  event type=%u status=%u datalen=%u queued", event_type, status,
+            datalen);
     g_queue_push_tail(s->event_fifo, resp);
 }
 
@@ -406,6 +465,32 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
                      * the initial short read is just peeking at the header. */
                     if (total && want >= total) {
                         g_free(g_queue_pop_head(q));
+                    }
+                }
+                /* Idle: nothing is outstanding, so this is the safe moment to
+                 * deliver an unsolicited event. */
+                if (!total && s->scan_pending) {
+                    BCM4325EscanResult r;
+                    s->scan_pending = false;
+                    memset(&r, 0, sizeof(r));
+                    r.buflen = sizeof(r);
+                    r.version = BCM4325_ESCAN_VERSION;
+                    r.sync_id = 1;
+                    r.bss_count = 1;
+                    bcm4325_fill_bss(&r.bss);
+                    /* This driver scans with iscan, the API that predates
+                     * escan, so the completion it waits for is SCAN_COMPLETE
+                     * (26) rather than ESCAN_RESULT (69). */
+                    bcm4325_queue_event_data(s, BRCMF_E_SCAN_COMPLETE,
+                                             BRCMF_E_STATUS_SUCCESS, 0,
+                                             &r, sizeof(r));
+                    if (!g_queue_is_empty(s->event_fifo)) {
+                        BCM4325PendingResponse *ev =
+                            (BCM4325PendingResponse *)g_queue_peek_head(s->event_fifo);
+                        total = bcm4325_build_control_frame(ev, frame, sizeof(frame));
+                        if (total && want >= total) {
+                            g_free(g_queue_pop_head(s->event_fifo));
+                        }
                     }
                 }
                 if (!total) {

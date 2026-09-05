@@ -344,37 +344,13 @@ static void write_nand_pages(IPodTouchFMSSState *s)
             break;
         }
 
-        if (is_erase) {
-            /* An erase clears a whole block back to the blank state. Treating
-             * it as a program - which is what this did before - writes page
-             * data where the FTL expects erased flash, and it then reads back
-             * stale content from a block it believes it just cleared.
-             *
-             * Clearing the presence bits is enough: an absent page reads as
-             * 0xFF data and spare, which is what erased flash returns. The
-             * logical-page copies are left alone, since the FTL erases the
-             * physical block it is recycling, not the logical pages that once
-             * lived there - those have already been rewritten elsewhere. */
-            uint32_t blk_first = (page_nr / NAND_PAGES_PER_BLOCK)
-                                 * NAND_PAGES_PER_BLOCK;
-            for (uint32_t pg = blk_first;
-                 pg < blk_first + NAND_PAGES_PER_BLOCK; pg++) {
-                uint64_t bit = (uint64_t)cs * NAND_PAGES_PER_CS + pg;
-                if (s->nand_bitmap) {
-                    s->nand_bitmap[bit >> 3] &= ~(1u << (bit & 7));
-                }
-            }
-            if (s->nand_image && s->nand_bitmap) {
-                uint64_t first_bit = (uint64_t)cs * NAND_PAGES_PER_CS + blk_first;
-                uint64_t off = NAND_IMAGE_RECORD_AREA + (first_bit >> 3);
-                if (fseeko(s->nand_image, (off_t)off, SEEK_SET) == 0) {
-                    fwrite(&s->nand_bitmap[first_bit >> 3], 1,
-                           NAND_PAGES_PER_BLOCK / 8, s->nand_image);
-                    fflush(s->nand_image);
-                }
-            }
-            continue;   /* an erase carries no page data */
-        }
+        /* Flag bit 8 is not an erase. It is the only form that ever appears
+         * in a trace - the plain 0x00801000 program flag is never seen, while
+         * pages are demonstrably written - so it is a program variant whose
+         * meaning is still unknown. Treating it as an erase clears whole
+         * blocks the FTL still needs, including the context blocks at the
+         * start of the device, and the volume then fails to mount with
+         * "Not HFS+ (signature 0xffff)". */
 
         int half = NAND_BYTES_PER_PAGE / 2;
         for (int i = 0; i < 2; i++) {
@@ -387,7 +363,6 @@ static void write_nand_pages(IPodTouchFMSSState *s)
                                  s->page_spare_buffer, 12);
 
         uint64_t rec = (uint64_t)cs * NAND_PAGES_PER_CS + page_nr;
-
         /* A data page is stored under its logical number, so a later read of
          * any slot the FTL maps to that number returns this content. */
         if (fmss_spare_is_data(s->page_spare_buffer)) {

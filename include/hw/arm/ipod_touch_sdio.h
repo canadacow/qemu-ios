@@ -147,8 +147,10 @@ typedef struct BCM4325CdcHeader
 #define BCMILCP_BCM_SUBTYPE_EVENT    1
 #define BRCMF_E_LINK           16     /* link up/down */
 #define BRCMF_E_SET_SSID       0      /* join completed */
-#define BRCMF_E_ESCAN_RESULT   69     /* scan results ready */
+#define BRCMF_E_ESCAN_RESULT   69     /* scan results ready (newer escan API) */
+#define BRCMF_E_SCAN_COMPLETE  26     /* scan finished (the iscan API this driver uses) */
 #define BRCMF_E_STATUS_SUCCESS 0
+#define BRCMF_E_STATUS_PARTIAL 8
 #define BRCMF_EVENT_MSG_LINK   0x01
 
 typedef struct BCM4325EventHeader
@@ -175,6 +177,57 @@ typedef struct BCM4325EventHeader
     uint8_t  ifidx;
     uint8_t  bsscfgidx;
 } __attribute__((__packed__)) BCM4325EventHeader;
+
+/* ---- scan results -------------------------------------------------------
+ * The driver scans with the iscan iovar and expects the networks found to
+ * arrive as escan-result events. Reporting none leaves the stack with no
+ * network to join; reporting one that is consistent with the association
+ * state is what lets it settle. Layout follows brcmfmac's
+ * struct brcmf_bss_info_le / brcmf_escan_result_le (little-endian).
+ */
+typedef struct BCM4325BssInfo
+{
+    uint32_t version;
+    uint32_t length;
+    uint8_t  bssid[6];
+    uint16_t beacon_period;
+    uint16_t capability;
+    uint8_t  ssid_len;
+    uint8_t  ssid[32];
+    struct {
+        uint32_t count;
+        uint8_t  rates[16];
+    } rateset;
+    uint16_t chanspec;
+    uint16_t atim_window;
+    uint8_t  dtim_period;
+    uint16_t rssi;
+    int8_t   phy_noise;
+    uint8_t  n_cap;
+    uint32_t nbss_cap;
+    uint8_t  ctl_ch;
+    uint32_t reserved32[1];
+    uint8_t  flags;
+    uint8_t  reserved[3];
+    uint8_t  basic_mcs[16];
+    uint16_t ie_offset;
+    uint32_t ie_length;
+    uint16_t snr;
+} __attribute__((__packed__)) BCM4325BssInfo;
+
+typedef struct BCM4325EscanResult
+{
+    uint32_t buflen;
+    uint32_t version;
+    uint16_t sync_id;
+    uint16_t bss_count;
+    BCM4325BssInfo bss;
+} __attribute__((__packed__)) BCM4325EscanResult;
+
+#define BCM4325_BSS_VERSION    109       /* brcmfmac: BRCMF_BSS_INFO_VERSION */
+#define BCM4325_ESCAN_VERSION  1
+#define BCM4325_FAKE_SSID      "qemu-ios"
+#define BCM4325_FAKE_CHANNEL   0x2b06    /* 2.4GHz, channel 6, 20MHz */
 
 /* A control response waiting to be collected by the host. */
 typedef struct BCM4325PendingResponse
@@ -216,6 +269,7 @@ typedef struct IPodTouchSDIOState
                              * it were the answer to the next command */
     NICState *nic;          /* host network backend */
     NICConf conf;
+    bool scan_pending;      /* a scan was asked for; answer it when idle */
     bool link_up_sent;      /* the association event is sent once */
     uint8_t registers[0x10000];
 } IPodTouchSDIOState;
