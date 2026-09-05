@@ -1,4 +1,5 @@
 #include "hw/arm/ipod_touch_sdio.h"
+#include <string.h>
 #include "hw/arm/ipod_touch_debug.h"
 #include "qemu/error-report.h"
 
@@ -87,6 +88,22 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
     }
     BCM4325CdcHeader *cdc = (BCM4325CdcHeader *)(frame + off);
 
+    /* GET_VAR/SET_VAR carry the variable name as a NUL-terminated string at
+     * the start of the payload; log it, since it says what the driver wants. */
+    const char *iovar = "";
+    char namebuf[64];
+    if ((cdc->cmd == 262 || cdc->cmd == 263) &&
+        off + CDC_REQUEST_HEADER_LEN < len) {
+        /* dump the 8 bytes around the assumed payload start, to place it */
+        const char *p = (const char *)(frame + off + CDC_REQUEST_HEADER_LEN);
+        uint32_t avail = len - off - CDC_REQUEST_HEADER_LEN;
+        uint32_t n = 0;
+        while (n < avail && n < sizeof(namebuf) - 1 && p[n] >= 0x20 && p[n] < 0x7f) {
+            namebuf[n] = p[n]; n++;
+        }
+        namebuf[n] = 0;
+        iovar = namebuf;
+    }
     BCM4325PendingResponse *resp = g_malloc0(sizeof(*resp));
     resp->cmd    = cdc->cmd;
     resp->flags  = cdc->flags;      /* carries the request id the host checks */
@@ -103,9 +120,26 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
         resp->payload_len = sizeof(resp->payload);
     }
 
-    SDTRACE("  CDC cmd=%u %s len=%u id=%u", cdc->cmd,
+    /* Answer the queries whose value the driver actually acts on. Everything
+     * else still returns zeros, which reads as "feature absent / disabled"
+     * and keeps initialisation moving. */
+    if (cdc->cmd == CDC_CMD_GET_VAR && resp->payload_len >= 6 &&
+        (!strcmp(iovar, "cur_etheraddr") || !strcmp(iovar, "perm_etheraddr"))) {
+        /* Locally-administered address; the OTP would hold this on real
+         * hardware. Without it the interface has no identity and the stack
+         * will not bring it up. */
+        static const uint8_t mac[6] = { 0x02, 0x00, 0x4c, 0x43, 0x25, 0x01 };
+        memcpy(resp->payload, mac, sizeof(mac));
+    } else if (cdc->cmd == CDC_CMD_GET_VAR && resp->payload_len >= 4 &&
+               !strcmp(iovar, "ver")) {
+        /* A printable firmware version string; the driver logs it. */
+        snprintf((char *)resp->payload, sizeof(resp->payload),
+                 "wl0: emulated BCM4325 (qemu-ios)");
+    }
+
+    SDTRACE("  CDC cmd=%u %s len=%u id=%u %s", cdc->cmd,
             (cdc->flags & CDC_DCMD_SET) ? "set" : "get",
-            cdc->len & 0xFFFF, cdc->flags >> 16);
+            cdc->len & 0xFFFF, cdc->flags >> 16, iovar);
 
     g_queue_push_tail(s->rx_fifo, resp);
 }

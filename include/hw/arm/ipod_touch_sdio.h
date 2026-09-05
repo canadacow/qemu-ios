@@ -119,6 +119,18 @@ typedef struct BCM4325CdcHeader
 #define SDPCM_DATA_CHANNEL     2
 #define SDPCM_HEADER_LEN       (sizeof(BCM4325FrameHeaderPacket) +                                 sizeof(BCM4325SdpcmHeader))
 #define CDC_DCMD_SET           0x02   /* 0 = get, 1 = set */
+/* A request header carries cmd, len and flags; status is present only in the
+ * response, so an iovar name begins 12 bytes into the command, not 16. */
+#define CDC_REQUEST_HEADER_LEN 12
+
+/* CDC command numbers used by the driver (brcmfmac: BRCMF_C_*). */
+#define CDC_CMD_UP             2
+#define CDC_CMD_SET_INFRA     38
+#define CDC_CMD_GET_MAGIC     83
+#define CDC_CMD_GET_VERSION   84
+#define CDC_CMD_GET_BSSID     86
+#define CDC_CMD_GET_VAR      262
+#define CDC_CMD_SET_VAR      263
 
 /* A control response waiting to be collected by the host. */
 typedef struct BCM4325PendingResponse
