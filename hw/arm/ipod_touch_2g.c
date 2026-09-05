@@ -11,6 +11,7 @@
 #include "hw/qdev-clock.h"
 #include "hw/arm/exynos4210.h"
 #include "hw/arm/ipod_touch_2g.h"
+#include "net/net.h"
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
 #include "hw/arm/ipod_touch_debug.h"
@@ -334,6 +335,9 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("ipodtouch.sdio");
     IPodTouchSDIOState *sdio_state = IPOD_TOUCH_SDIO(dev);
     nms->sdio_state = sdio_state;
+    /* Attach the WLAN device to a host network backend, so -netdev on the
+     * command line reaches the guest's en0. */
+    qdev_set_nic_properties(dev, &nd_table[0]);
     memory_region_add_subregion(sysmem, SDIO_MEM_BASE, &sdio_state->iomem);
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_realize(busdev, &error_fatal);

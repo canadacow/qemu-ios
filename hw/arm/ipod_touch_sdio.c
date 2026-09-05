@@ -1,5 +1,9 @@
 #include "hw/arm/ipod_touch_sdio.h"
 #include <string.h>
+#include "net/eth.h"
+#include "qemu/main-loop.h"
+#include "qapi/error.h"
+#include "hw/qdev-properties.h"
 #include "hw/arm/ipod_touch_debug.h"
 #include "qemu/error-report.h"
 
@@ -12,6 +16,9 @@
 #define SDTRACE(fmt, ...) do { \
     fprintf(stderr, "sdio: " fmt "\n", ##__VA_ARGS__); \
     fflush(stderr); } while (0)
+
+static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
+                                uint32_t status, uint32_t flags);
 
 /* Value the backplane returns for a 32-bit read at a windowed F1 address.
  *
@@ -83,6 +90,20 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
     BCM4325SdpcmHeader *sdpcm =
         (BCM4325SdpcmHeader *)(frame + sizeof(BCM4325FrameHeaderPacket));
     uint32_t off = sdpcm->data_offset ? sdpcm->data_offset : SDPCM_HEADER_LEN;
+
+    /* A data frame is an Ethernet packet the guest is transmitting: hand it
+     * to the host network rather than parsing it as a command. */
+    if (sdpcm->channel == SDPCM_DATA_CHANNEL) {
+        BCM4325FrameHeaderPacket *tag = (BCM4325FrameHeaderPacket *)frame;
+        uint32_t flen = tag->frame_length;
+        if (flen > off && flen <= len && s->nic) {
+            qemu_send_packet(qemu_get_queue(s->nic), frame + off, flen - off);
+            SDTRACE("  tx %u bytes to the network", flen - off);
+        } else {
+            SDTRACE("  tx dropped: frame_length=%u off=%u len=%u", flen, off, len);
+        }
+        return;
+    }
     if (off + sizeof(BCM4325CdcHeader) > len) {
         return;
     }
@@ -105,9 +126,17 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
         iovar = namebuf;
     }
     BCM4325PendingResponse *resp = g_malloc0(sizeof(*resp));
+    resp->channel = SDPCM_CONTROL_CHANNEL;
     resp->cmd    = cdc->cmd;
     resp->flags  = cdc->flags;      /* carries the request id the host checks */
     resp->status = 0;               /* success */
+
+    /* Note: returning an error for GET_BSSID stops the driver four commands
+     * short of where it otherwise reaches, so the association state is left
+     * reported as success for now. The zeroed BSSID that implies is what leads
+     * configd to present the Ask To Join panel, which SpringBoard sometimes
+     * fails to answer - the spinner. Both halves need a real scan result to
+     * resolve properly. */
 
     /* The host checks the response's len against the length it sent, so echo
      * that back whatever we actually return. A get carries that many bytes of
@@ -128,8 +157,7 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
         /* Locally-administered address; the OTP would hold this on real
          * hardware. Without it the interface has no identity and the stack
          * will not bring it up. */
-        static const uint8_t mac[6] = { 0x02, 0x00, 0x4c, 0x43, 0x25, 0x01 };
-        memcpy(resp->payload, mac, sizeof(mac));
+        memcpy(resp->payload, s->conf.macaddr.a, 6);
     } else if (cdc->cmd == CDC_CMD_GET_VAR && resp->payload_len >= 4 &&
                !strcmp(iovar, "ver")) {
         /* A printable firmware version string; the driver logs it. */
@@ -142,14 +170,24 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
             cdc->len & 0xFFFF, cdc->flags >> 16, iovar);
 
     g_queue_push_tail(s->rx_fifo, resp);
+
+    /* Events are not injected yet. The wire format and the delivery channel
+     * are right - sent as data frames they no longer draw "WTF?? Got an event
+     * packet!!!" - but pushing three of them straight after the iscan reply
+     * lands them in the middle of the driver's command/response cycle: it
+     * reads the first event where it expects the next command's reply, and
+     * AppleBCM4325CmdManager then fails its cmd/len/transaction-id asserts and
+     * blocks, which is the spinner. Association needs the driver to be idle
+     * between commands before an event can be delivered safely. */
 }
 
 /* Build the frame the host reads back for a queued control response. */
 static uint32_t bcm4325_build_control_frame(BCM4325PendingResponse *resp,
                                             uint8_t *out, uint32_t max)
 {
-    uint32_t total = SDPCM_HEADER_LEN + sizeof(BCM4325CdcHeader) +
-                     resp->payload_len;
+    uint32_t total = SDPCM_HEADER_LEN + resp->payload_len +
+                     (resp->channel == SDPCM_CONTROL_CHANNEL
+                          ? sizeof(BCM4325CdcHeader) : 0);
     if (total > max) { return 0; }
     memset(out, 0, total);
 
@@ -159,27 +197,110 @@ static uint32_t bcm4325_build_control_frame(BCM4325PendingResponse *resp,
 
     BCM4325SdpcmHeader *sdpcm =
         (BCM4325SdpcmHeader *)(out + sizeof(BCM4325FrameHeaderPacket));
-    sdpcm->channel = SDPCM_CONTROL_CHANNEL;
+    sdpcm->channel = resp->channel;
     sdpcm->data_offset = SDPCM_HEADER_LEN;
     sdpcm->max_sequence = 4;      /* credit for further transmissions */
 
-    BCM4325CdcHeader *cdc = (BCM4325CdcHeader *)(out + SDPCM_HEADER_LEN);
-    cdc->cmd    = resp->cmd;
-    cdc->len    = resp->len;
-    cdc->flags  = resp->flags;
-    cdc->status = resp->status;
-
-    if (resp->payload_len) {
-        memcpy(out + SDPCM_HEADER_LEN + sizeof(BCM4325CdcHeader),
-               resp->payload, resp->payload_len);
+    if (resp->channel == SDPCM_CONTROL_CHANNEL) {
+        BCM4325CdcHeader *cdc = (BCM4325CdcHeader *)(out + SDPCM_HEADER_LEN);
+        cdc->cmd    = resp->cmd;
+        cdc->len    = resp->len;
+        cdc->flags  = resp->flags;
+        cdc->status = resp->status;
+        if (resp->payload_len) {
+            memcpy(out + SDPCM_HEADER_LEN + sizeof(BCM4325CdcHeader),
+                   resp->payload, resp->payload_len);
+        }
+    } else {
+        /* Event and data frames carry their payload directly. */
+        memcpy(out + SDPCM_HEADER_LEN, resp->payload, resp->payload_len);
     }
     return total;
 }
 
+
+/* Queue a firmware event. The driver subscribes to these with event_msgs and
+ * waits for them; a link-up event is what tells the stack it is associated. */
+static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
+                                uint32_t status, uint32_t flags)
+{
+    BCM4325PendingResponse *resp = g_malloc0(sizeof(*resp));
+    const uint8_t *mac = s->conf.macaddr.a;
+    BCM4325EventHeader *ev = (BCM4325EventHeader *)resp->payload;
+
+    /* Real firmware delivers events to the host as ordinary data frames that
+     * the stack recognises by their 0x886C ethertype - not on a separate
+     * channel. Marking them as channel 1 makes AppleBCM4325 report "WTF?? Got
+     * an event packet!!!" from its data-frame path. */
+    resp->channel = SDPCM_DATA_CHANNEL;
+
+    memcpy(ev->dest, mac, 6);
+    memcpy(ev->src, mac, 6);
+    ev->ethertype   = cpu_to_be16(0x886C);
+    ev->subtype     = cpu_to_be16(BCMILCP_SUBTYPE_VENDOR_LONG);
+    ev->length      = cpu_to_be16(sizeof(*ev) - 12);
+    ev->version     = 0;
+    ev->oui[0] = BRCM_OUI_0; ev->oui[1] = BRCM_OUI_1; ev->oui[2] = BRCM_OUI_2;
+    ev->usr_subtype = cpu_to_be16(BCMILCP_BCM_SUBTYPE_EVENT);
+    ev->msg_version = cpu_to_be16(2);
+    ev->flags       = cpu_to_be16(flags);
+    ev->event_type  = cpu_to_be32(event_type);
+    ev->status      = cpu_to_be32(status);
+    ev->reason      = 0;
+    ev->auth_type   = 0;
+    ev->datalen     = 0;
+    memcpy(ev->addr, mac, 6);
+    g_strlcpy(ev->ifname, "eth0", sizeof(ev->ifname));
+    ev->ifidx = 0;
+    ev->bsscfgidx = 0;
+
+    resp->payload_len = sizeof(*ev);
+    SDTRACE("  event type=%u status=%u queued", event_type, status);
+    g_queue_push_tail(s->event_fifo, resp);
+}
+
+/* A frame arriving from the host network. Hand it to the guest on the data
+ * channel, wrapped the same way a real device would. */
+static ssize_t bcm4325_receive(NetClientState *nc, const uint8_t *buf,
+                               size_t size)
+{
+    IPodTouchSDIOState *s = qemu_get_nic_opaque(nc);
+    BCM4325PendingResponse *resp;
+
+    if (size > sizeof(resp->payload)) {
+        return size;   /* drop oversized frames rather than truncate */
+    }
+    resp = g_malloc0(sizeof(*resp));
+    resp->channel = SDPCM_DATA_CHANNEL;
+    memcpy(resp->payload, buf, size);
+    resp->payload_len = size;
+    SDTRACE("  rx %u bytes from the network: ethertype %02x%02x",
+            (unsigned)size, size > 13 ? buf[12] : 0, size > 13 ? buf[13] : 0);
+
+    /* Network receive callbacks already run with the big QEMU lock held, so
+     * this must not take it again - doing so deadlocks the emulator and the
+     * guest then panics with "Unable to communicate with SDIO device". */
+    g_queue_push_tail(s->event_fifo, resp);
+    s->irq_reg |= 0x1;
+    qemu_irq_raise(s->irq);
+    return size;
+}
+
+static NetClientInfo net_bcm4325_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = bcm4325_receive,
+};
+
 static void trigger_irq(void *opaque)
 {
     IPodTouchSDIOState *s = (IPodTouchSDIOState *)opaque;
-    s->irq_reg = 0x2;
+    /* Set the data-ready bit without clearing transfer-complete: the two are
+     * independent causes sharing one register, and this timer fires 10ms after
+     * a write. Overwriting the register loses the completion the host is still
+     * waiting for, and it then blocks until the SDIO layer reports a DMA
+     * timeout. */
+    s->irq_reg |= 0x2;
     qemu_irq_raise(s->irq);
 }
 
@@ -275,14 +396,16 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
                 uint8_t frame[2048] = { 0 };
                 uint32_t total = 0;
 
-                if (!g_queue_is_empty(s->rx_fifo)) {
+                GQueue *q = !g_queue_is_empty(s->rx_fifo) ? s->rx_fifo
+                                                          : s->event_fifo;
+                if (!g_queue_is_empty(q)) {
                     BCM4325PendingResponse *resp =
-                        (BCM4325PendingResponse *)g_queue_peek_head(s->rx_fifo);
+                        (BCM4325PendingResponse *)g_queue_peek_head(q);
                     total = bcm4325_build_control_frame(resp, frame, sizeof(frame));
                     /* Only consume it once the host asks for the full frame;
                      * the initial short read is just peeking at the header. */
                     if (total && want >= total) {
-                        g_free(g_queue_pop_head(s->rx_fifo));
+                        g_free(g_queue_pop_head(q));
                     }
                 }
                 if (!total) {
@@ -294,14 +417,30 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
                      * which is how an idle device answers a poll. */
                     total = 0;
                 }
-                if (total) {
-                    cpu_physical_memory_write(s->baddr, frame,
-                                              want < total ? want : total);
+                if (total >= SDPCM_HEADER_LEN + sizeof(BCM4325CdcHeader)) {
+                    BCM4325CdcHeader *dbg =
+                        (BCM4325CdcHeader *)(frame + SDPCM_HEADER_LEN);
+                    SDTRACE("  F2 read want=%u -> %u bytes  reply cmd=%u len=%u "
+                            "id=%u status=%u", want, total, dbg->cmd, dbg->len,
+                            dbg->flags >> 16, dbg->status);
                 } else {
-                    uint8_t empty[4] = { 0, 0, 0, 0 };
-                    cpu_physical_memory_write(s->baddr, empty,
-                                              want < 4 ? want : 4);
+                    SDTRACE("  F2 read want=%u -> %u bytes%s", want, total,
+                            total ? "" : " (no frame)");
                 }
+                /* Write the whole length the host asked for, not just the
+                 * frame. A short write leaves the tail of its buffer holding
+                 * the previous response, and it then parses a stale CDC header
+                 * - which is what the driver reports as three failed asserts on
+                 * cmd, len and transaction id. frame[] is zeroed, so the
+                 * padding reads as zeros. */
+                /* Never write more than the host asked for: its 12-byte peek
+                 * buffer is 12 bytes, and overrunning it corrupts guest kernel
+                 * memory - the SDIO controller then wedges with "timed out on
+                 * DMA transaction" and the filesystem is damaged enough to drop
+                 * the device into recovery. Pad with zeros when the frame is
+                 * shorter than the request. */
+                uint32_t fill = want < sizeof(frame) ? want : sizeof(frame);
+                cpu_physical_memory_write(s->baddr, frame, fill);
             }
             
         }
@@ -309,7 +448,7 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
         /* Every transfer completes with an interrupt: the host waits for it
          * during the firmware upload too, long before any frame exists, so
          * this cannot be made conditional on the receive queue. */
-        s->irq_reg = 0x1;
+        s->irq_reg |= 0x1;
         qemu_irq_raise(s->irq);
     }
     else {
@@ -343,7 +482,14 @@ static void ipod_touch_sdio_write(void *opaque, hwaddr addr, uint64_t value, uns
             s->csr = value;
             break;
         case SDIO_IRQ:
-            qemu_irq_lower(s->irq);
+            /* Write-one-to-clear: the host acknowledges the causes it has
+             * handled. The bits must be cleared here - they accumulate as
+             * separate causes, so leaving them set holds the interrupt
+             * asserted and the driver polls forever. */
+            s->irq_reg &= ~(uint32_t)value;
+            if (!s->irq_reg) {
+                qemu_irq_lower(s->irq);
+            }
             break;
         case SDIO_IRQMASK:
             s->irq_mask = value;
@@ -447,11 +593,43 @@ static void ipod_touch_sdio_init(Object *obj)
     s->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, trigger_irq, s);
 
     s->rx_fifo = g_queue_new();
+    s->event_fifo = g_queue_new();
 }
+
+static void ipod_touch_sdio_realize(DeviceState *dev, Error **errp)
+{
+    IPodTouchSDIOState *s = IPOD_TOUCH_SDIO(dev);
+
+    /* The MAC the CIS advertises, unless one was given on the command line. */
+    static const uint8_t default_mac[6] = { 0x00, 0x23, 0x32, 0x6E, 0xAA, 0x10 };
+    bool have_mac = false;
+    for (int i = 0; i < 6; i++) {
+        if (s->conf.macaddr.a[i]) { have_mac = true; break; }
+    }
+    if (!have_mac) {
+        memcpy(s->conf.macaddr.a, default_mac, sizeof(default_mac));
+    }
+    for (int i = 0; i < 6; i++) {
+        s->registers[CIS_OFFSET + 10 + i] = s->conf.macaddr.a[i];
+    }
+
+    s->nic = qemu_new_nic(&net_bcm4325_info, &s->conf,
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+}
+
+static Property ipod_touch_sdio_properties[] = {
+    DEFINE_NIC_PROPERTIES(IPodTouchSDIOState, conf),
+    DEFINE_PROP_END_OF_LIST(),
+};
 
 static void ipod_touch_sdio_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = ipod_touch_sdio_realize;
+    device_class_set_props(dc, ipod_touch_sdio_properties);
 }
 
 static const TypeInfo ipod_touch_sdio_type_info = {

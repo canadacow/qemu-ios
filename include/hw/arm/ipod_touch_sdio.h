@@ -5,6 +5,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/sysbus.h"
+#include "net/net.h"
 #include "hw/hw.h"
 #include "hw/irq.h"
 
@@ -132,9 +133,53 @@ typedef struct BCM4325CdcHeader
 #define CDC_CMD_GET_VAR      262
 #define CDC_CMD_SET_VAR      263
 
+/* ---- firmware events ----------------------------------------------------
+ * The driver subscribes to asynchronous events with the event_msgs iovar and
+ * then waits for them: without a link-up event nothing tells the stack it is
+ * associated, and configd retries auto-join forever. Events arrive on SDPCM
+ * channel 1 shaped as an Ethernet frame carrying a Broadcom-specific header
+ * and a big-endian message (brcmfmac: struct brcmf_event).
+ */
+#define BRCM_OUI_0             0x00
+#define BRCM_OUI_1             0x10
+#define BRCM_OUI_2             0x18
+#define BCMILCP_SUBTYPE_VENDOR_LONG  32769
+#define BCMILCP_BCM_SUBTYPE_EVENT    1
+#define BRCMF_E_LINK           16     /* link up/down */
+#define BRCMF_E_SET_SSID       0      /* join completed */
+#define BRCMF_E_ESCAN_RESULT   69     /* scan results ready */
+#define BRCMF_E_STATUS_SUCCESS 0
+#define BRCMF_EVENT_MSG_LINK   0x01
+
+typedef struct BCM4325EventHeader
+{
+    uint8_t  dest[6];
+    uint8_t  src[6];
+    uint16_t ethertype;      /* big-endian 0x886C */
+    /* Broadcom header */
+    uint16_t subtype;        /* big-endian */
+    uint16_t length;         /* big-endian */
+    uint8_t  version;
+    uint8_t  oui[3];
+    uint16_t usr_subtype;    /* big-endian */
+    /* event message, all big-endian */
+    uint16_t msg_version;
+    uint16_t flags;
+    uint32_t event_type;
+    uint32_t status;
+    uint32_t reason;
+    uint32_t auth_type;
+    uint32_t datalen;
+    uint8_t  addr[6];
+    char     ifname[16];
+    uint8_t  ifidx;
+    uint8_t  bsscfgidx;
+} __attribute__((__packed__)) BCM4325EventHeader;
+
 /* A control response waiting to be collected by the host. */
 typedef struct BCM4325PendingResponse
 {
+    uint8_t  channel;       /* SDPCM channel: control, event or data */
     uint32_t cmd;
     uint32_t len;
     uint32_t flags;
@@ -165,7 +210,13 @@ typedef struct IPodTouchSDIOState
     QEMUTimer *irq_timer;
     qemu_irq irq;
     qemu_irq irq2;
-    GQueue *rx_fifo;
+    GQueue *rx_fifo;        /* control responses awaiting collection */
+    GQueue *event_fifo;     /* events and received frames: a separate queue, or
+                             * an event queued mid-sequence is collected as if
+                             * it were the answer to the next command */
+    NICState *nic;          /* host network backend */
+    NICConf conf;
+    bool link_up_sent;      /* the association event is sent once */
     uint8_t registers[0x10000];
 } IPodTouchSDIOState;
 
