@@ -345,17 +345,35 @@ static void write_nand_pages(IPodTouchFMSSState *s)
         }
 
         if (is_erase) {
-            /* Flag bit 8 is NOT an erase: it appears on pages 6 and 8 of a
-             * block the FTL is filling sequentially (0,1,2,...), so it is a
-             * program variant (meaning of the bit unknown). Refusing it left
-             * holes in the log block. Write it like any other program and
-             * note it. */
-            {
-                warn_report("fmss WRITE[%d] w0=0x%08x has flag bit 8 - treating as "
-                            "program of cs=%u page=%u (blk %u pg %u)", idx, w0, cs,
-                            page_nr, page_nr / NAND_PAGES_PER_BLOCK,
-                            page_nr % NAND_PAGES_PER_BLOCK);
+            /* An erase clears a whole block back to the blank state. Treating
+             * it as a program - which is what this did before - writes page
+             * data where the FTL expects erased flash, and it then reads back
+             * stale content from a block it believes it just cleared.
+             *
+             * Clearing the presence bits is enough: an absent page reads as
+             * 0xFF data and spare, which is what erased flash returns. The
+             * logical-page copies are left alone, since the FTL erases the
+             * physical block it is recycling, not the logical pages that once
+             * lived there - those have already been rewritten elsewhere. */
+            uint32_t blk_first = (page_nr / NAND_PAGES_PER_BLOCK)
+                                 * NAND_PAGES_PER_BLOCK;
+            for (uint32_t pg = blk_first;
+                 pg < blk_first + NAND_PAGES_PER_BLOCK; pg++) {
+                uint64_t bit = (uint64_t)cs * NAND_PAGES_PER_CS + pg;
+                if (s->nand_bitmap) {
+                    s->nand_bitmap[bit >> 3] &= ~(1u << (bit & 7));
+                }
             }
+            if (s->nand_image && s->nand_bitmap) {
+                uint64_t first_bit = (uint64_t)cs * NAND_PAGES_PER_CS + blk_first;
+                uint64_t off = NAND_IMAGE_RECORD_AREA + (first_bit >> 3);
+                if (fseeko(s->nand_image, (off_t)off, SEEK_SET) == 0) {
+                    fwrite(&s->nand_bitmap[first_bit >> 3], 1,
+                           NAND_PAGES_PER_BLOCK / 8, s->nand_image);
+                    fflush(s->nand_image);
+                }
+            }
+            continue;   /* an erase carries no page data */
         }
 
         int half = NAND_BYTES_PER_PAGE / 2;
