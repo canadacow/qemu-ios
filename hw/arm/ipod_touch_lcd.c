@@ -327,15 +327,9 @@ static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int bu
 static void refresh_timer_tick(void *opaque)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
-    {
-        static unsigned ticks;
-        if (++ticks % 60 == 0) { warn_report("lcd: tick %us", ticks / 60); }
-    }
-
-    if (s->render == 0x1)
-	qemu_irq_raise(s->irq);
-    else if (s->render == 0xFF)
-	qemu_irq_lower(s->irq);
+    /* Raise every frame: gating on the render register loses the interrupt
+     * permanently when a framebuffer handover clears it. */
+    qemu_irq_raise(s->irq);
 
     timer_mod(s->refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / 60);//LCD_REFRESH_RATE_FREQUENCY);
 }
