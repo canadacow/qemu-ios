@@ -62,6 +62,7 @@ typedef struct IPodTouchFMSSState
     uint8_t *page_spare_buffer;
 
     uint32_t reg_cs_irq_bit;
+    QEMUTimer *complete_timer;   /* asynchronous command completion */
     uint32_t reg_cinfo_target_addr;
     uint32_t reg_pages_in_addr;
     uint32_t reg_cs_buf_addr;

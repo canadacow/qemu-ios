@@ -1,4 +1,16 @@
 #include "hw/arm/ipod_touch_clock.h"
+#include "qemu/error-report.h"
+
+/* Report registers this model does not implement: they read as zero, and a
+ * guest polling one for a ready bit waits forever with nothing in the log. */
+#define UNHANDLED_READ(dev, a) do { \
+    static uint32_t seen_[64]; static int nseen_; \
+    bool dup_ = false; \
+    for (int i_ = 0; i_ < nseen_; i_++) { \
+        if (seen_[i_] == (uint32_t)(a)) { dup_ = true; break; } } \
+    if (!dup_ && nseen_ < 64) { seen_[nseen_++] = (uint32_t)(a); \
+        warn_report("%s: unhandled read at 0x%03x -> 0", dev, (uint32_t)(a)); } \
+} while (0)
 
 static void s5l8900_clock_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
@@ -117,6 +129,7 @@ static uint64_t s5l8900_clock_read(void *opaque, hwaddr addr, unsigned size)
       default:
             hw_error("%s: reading from unknown clock register 0x%08x\n", __func__, addr);
     }
+    UNHANDLED_READ("clock", addr);
     return 0;
 }
 

@@ -2,6 +2,17 @@
 #include "qemu/error-report.h"
 #include "hw/arm/ipod_touch_debug.h"
 
+/* Report registers this model does not implement: they read as zero, and a
+ * guest polling one for a ready bit waits forever with nothing in the log. */
+#define UNHANDLED_READ(dev, a) do { \
+    static uint32_t seen_[64]; static int nseen_; \
+    bool dup_ = false; \
+    for (int i_ = 0; i_ < nseen_; i_++) { \
+        if (seen_[i_] == (uint32_t)(a)) { dup_ = true; break; } } \
+    if (!dup_ && nseen_ < 64) { seen_[nseen_++] = (uint32_t)(a); \
+        warn_report("%s: unhandled read at 0x%03x -> 0", dev, (uint32_t)(a)); } \
+} while (0)
+
 uint64_t temp_storage[512];
 
 
@@ -198,6 +209,24 @@ static void read_nand_pages(IPodTouchFMSSState *s)
                     == NAND_BYTES_PER_SPARE) {
                 page_present = true;
 
+                /* Multi-page reads have never been verified: log what each
+                 * entry decodes to and the lpn stamp of the page served. For a
+                 * read of consecutive logical pages the stamps must be
+                 * consecutive; scattered stamps mean the per-entry decode is
+                 * wrong and the guest is receiving the wrong pages. */
+                {
+                    static unsigned multi_reads;
+                    if (s->reg_num_pages > 1 && multi_reads < 14 * 8) {
+                        multi_reads++;
+                        bool d = fmss_spare_is_data(s->page_spare_buffer);
+                        warn_report("fmss: multiread n=%u entry %d: cs=%u page=%u "
+                                    "(blk %u pib %u) -> %s lpn=%u", s->reg_num_pages,
+                                    page_ind, cs, page_nr, page_nr / 256,
+                                    page_nr % 128, d ? "data" : "meta",
+                                    d ? fmss_spare_lpn(s->page_spare_buffer) : 0);
+                    }
+                }
+
                 if (fmss_spare_is_data(s->page_spare_buffer)) {
                     uint32_t lpn = fmss_spare_lpn(s->page_spare_buffer);
                     uint8_t lbuf[NAND_BYTES_PER_PAGE], lspare[NAND_BYTES_PER_SPARE];
@@ -314,7 +343,10 @@ static void write_nand_pages(IPodTouchFMSSState *s)
      * page data is in the same two 2048-byte halves the read path uses,
      * indexed from pages_out, and the 12 bytes of FTL spare metadata at
      * spare_out + idx*12. */
+    static unsigned multi_seen, max_entries;
+    int entries = 0;
     for (int idx = 0; idx < FMSS_WRITE_MAX_ENTRIES; idx++) {
+        entries = idx + 1;
         uint32_t w0 = 0, w1 = 0, half_addr = 0;
         cpu_physical_memory_read(s->reg_pages_in_addr + (2 * idx) * sizeof(uint32_t),
                                  &w0, sizeof(uint32_t));
@@ -327,6 +359,15 @@ static void write_nand_pages(IPodTouchFMSSState *s)
         bool is_program  = (flags == FMSS_WRITE_ENTRY_FLAGS);
         bool is_erase    = (flags == FMSS_ERASE_ENTRY_FLAGS);
         if (!(is_program || is_erase) || !one_hot) {
+            if (idx > 0 && w0 != 0 && w0 != 0xFFFFFFFFu) {
+                static unsigned cut_seen;
+                if (cut_seen < 12) {
+                    cut_seen++;
+                    warn_report("fmss: program CUT at entry %d: w0=0x%08x w1=0x%08x "
+                                "(d18=%u d28=%u) - pages after this are DROPPED",
+                                idx, w0, w1, s->reg_num_pages, s->reg_write_num_pages);
+                }
+            }
             if (idx == 0) {
                 warn_report("ipod_touch_fmss: descriptor word0=0x%08x word1=0x%08x "
                             "is neither program (0x%08x|cs) nor erase (0x%08x|cs) "
@@ -396,6 +437,24 @@ static void write_nand_pages(IPodTouchFMSSState *s)
         }
     }
     fflush(s->nand_image);
+
+    if (entries > 1) {
+        if (entries > max_entries) { max_entries = entries; }
+        if (multi_seen < 30) {
+            multi_seen++;
+            warn_report("fmss: program with %d entries (max so far %u)", entries, max_entries);
+        }
+    }
+    if (entries >= FMSS_WRITE_MAX_ENTRIES) {
+        /* Did the guest supply more than we processed? Peek at the next slot. */
+        uint32_t w0n = 0, w1n = 0;
+        cpu_physical_memory_read(s->reg_pages_in_addr + (2 * FMSS_WRITE_MAX_ENTRIES) * 4, &w0n, 4);
+        cpu_physical_memory_read(s->reg_pages_in_addr + (2 * FMSS_WRITE_MAX_ENTRIES + 1) * 4, &w1n, 4);
+        if ((w0n & ~0xFu) == FMSS_WRITE_ENTRY_FLAGS || (w0n & ~0xFu) == FMSS_ERASE_ENTRY_FLAGS) {
+            warn_report("fmss: TRUNCATED program - entry %d is valid (w0=0x%08x page=%u) "
+                        "but the loop stopped at the cap", FMSS_WRITE_MAX_ENTRIES, w0n, w1n);
+        }
+    }
 }
 
 static uint64_t ipod_touch_fmss_read(void *opaque, hwaddr addr, unsigned size)
@@ -421,6 +480,7 @@ static uint64_t ipod_touch_fmss_read(void *opaque, hwaddr addr, unsigned size)
             printf("%s: read invalid location 0x%08x.\n", __func__, addr);
             break;
     }
+    UNHANDLED_READ("fmss", addr);
     return 0;
 }
 
@@ -433,6 +493,9 @@ static void ipod_touch_fmss_write(void *opaque, hwaddr addr, uint64_t val, unsig
     switch(addr) {
         case 0xC00:
             if(val == 0x0000ffb5) { s->reg_cs_irq_bit = 1; } // TODO ugly and hard-coded
+            /* Completion is synchronous. Deferring it by 50us was tried and
+             * raised the hang rate from about half of boots to three in four,
+             * so the driver's interrupt path is the more fragile one here. */
             if(val == 0xfff5) { s->reg_cs_irq_bit = 1; qemu_set_irq(s->irq, 1); }
             break;
         case FMSS__CS_IRQ:
@@ -470,12 +533,44 @@ static void ipod_touch_fmss_write(void *opaque, hwaddr addr, uint64_t val, unsig
         case 0xD38:
             /* Transfer trigger. csgenrc selects the operation: 0xa01 reads the
              * pages named by the descriptor, 0xa02 programs them. */
+            {
+                static unsigned ncmd, nrd, nwr;
+                if (s->reg_csgenrc == 0xa01) { nrd++; } else if (s->reg_csgenrc == 0xa02) { nwr++; }
+                if (++ncmd % 250 == 0) {
+                    warn_report("fmss: heartbeat cmds=%u reads=%u programs=%u", ncmd, nrd, nwr);
+                }
+            }
             if (s->reg_csgenrc == 0xa01) { read_nand_pages(s); }
             else if (s->reg_csgenrc == 0xa02) { write_nand_pages(s); }
+            else {
+                /* Any other operation is dropped on the floor. The flash layer
+                 * advertises WriteMultiple; if that is a distinct command, every
+                 * bulk write - a journal replay, say - vanishes here silently. */
+                static uint32_t seen[16]; static int nseen;
+                bool dup = false;
+                for (int i = 0; i < nseen; i++) { if (seen[i] == s->reg_csgenrc) { dup = true; } }
+                if (!dup && nseen < 16) {
+                    uint32_t w[4] = {0};
+                    if (s->reg_pages_in_addr) { cpu_physical_memory_read(s->reg_pages_in_addr, w, 16); }
+                    seen[nseen++] = s->reg_csgenrc;
+                    warn_report("fmss: UNHANDLED command csgenrc=0x%x num_pages=%u d28=%u "
+                                "in[0..3]=%08x %08x %08x %08x - DROPPED",
+                                s->reg_csgenrc, s->reg_num_pages, s->reg_write_num_pages,
+                                w[0], w[1], w[2], w[3]);
+                }
+            }
             break;
         default:
             break;
     }
+}
+
+
+static void fmss_complete_cb(void *opaque)
+{
+    IPodTouchFMSSState *s = (IPodTouchFMSSState *)opaque;
+    s->reg_cs_irq_bit = 1;
+    qemu_set_irq(s->irq, 1);
 }
 
 static const MemoryRegionOps fmss_ops = {
@@ -498,6 +593,7 @@ static void ipod_touch_fmss_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &fmss_ops, s, "fmss", 0xF00);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+    s->complete_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, fmss_complete_cb, s);
 
     s->page_buffer = (uint8_t *)malloc(NAND_BYTES_PER_PAGE);
     s->page_spare_buffer = (uint8_t *)malloc(NAND_BYTES_PER_SPARE);

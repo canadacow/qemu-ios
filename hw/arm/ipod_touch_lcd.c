@@ -9,6 +9,17 @@
 #include "hw/display/framebuffer.h"
 #include "hw/arm/ipod_touch_debug.h"
 
+/* Report registers this model does not implement: they read as zero, and a
+ * guest polling one for a ready bit waits forever with nothing in the log. */
+#define UNHANDLED_READ(dev, a) do { \
+    static uint32_t seen_[64]; static int nseen_; \
+    bool dup_ = false; \
+    for (int i_ = 0; i_ < nseen_; i_++) { \
+        if (seen_[i_] == (uint32_t)(a)) { dup_ = true; break; } } \
+    if (!dup_ && nseen_ < 64) { seen_[nseen_++] = (uint32_t)(a); \
+        warn_report("%s: unhandled read at 0x%03x -> 0", dev, (uint32_t)(a)); } \
+} while (0)
+
 int lcd_brightness = 255;
 
 static uint64_t ipod_touch_lcd_read(void *opaque, hwaddr addr, unsigned size)
@@ -40,6 +51,7 @@ static uint64_t ipod_touch_lcd_read(void *opaque, hwaddr addr, unsigned size)
             printf("%s: read invalid location 0x%08x.\n", __func__, addr);
             break;
     }
+    UNHANDLED_READ("lcd", addr);
     return 0;
 }
 
@@ -55,7 +67,6 @@ static void ipod_touch_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsign
         case 0xC:
             s->render = val;
             qemu_irq_lower(s->irq);
-	    // qemu_irq_raise(s->irq);
             break;
         case 0x20:
             s->w1_display_depth_info = val;
@@ -316,6 +327,10 @@ static void ipod_touch_lcd_mouse_event(void *opaque, int x, int y, int z, int bu
 static void refresh_timer_tick(void *opaque)
 {
     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
+    {
+        static unsigned ticks;
+        if (++ticks % 60 == 0) { warn_report("lcd: tick %us", ticks / 60); }
+    }
 
     if (s->render == 0x1)
 	qemu_irq_raise(s->irq);

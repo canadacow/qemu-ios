@@ -434,6 +434,16 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
             ch = (uint8_t)val;
             /* XXX this blocks entire thread. Rewrite to use
              * qemu_chr_fe_write and background I/O callbacks */
+            /* Diagnostic anchor: virtual time against the console's newline count,
+             * once per virtual second, so guest timestamps in the serial log can be
+             * placed on the emulator's clock exactly. Channel 0 is the console. */
+            if (s->channel == 0 && ch == '\n') {
+                static uint64_t nl; static int64_t last;
+                nl++;
+                int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                if (now - last >= 1000000000LL) { last = now;
+                    fprintf(stderr, "uart0: t=%.3fs newline#%llu\n", now / 1e9, (unsigned long long)nl); fflush(stderr); }
+            }
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
             trace_exynos_uart_tx(s->channel, ch);
             s->reg[I_(UTRSTAT)] |= UTRSTAT_TRANSMITTER_EMPTY |
