@@ -316,6 +316,10 @@ static void read_nand_pages(IPodTouchFMSSState *s)
 #define FMSS_WRITE_MAX_ENTRIES   16
 #define FMSS_WRITE_ENTRY_FLAGS   0x00801000u
 #define FMSS_ERASE_ENTRY_FLAGS   0x00801100u   /* program flags | bit 8 */
+/* Bits seen set on the second entry of a two-page program (0x70811001) but
+ * not on the first (0x00801001). Meaning unknown; they do not change what the
+ * entry is, so they are masked before classifying it. */
+#define FMSS_ENTRY_FLAG_IGNORE   0x70010000u
 
 
 
@@ -354,10 +358,29 @@ static void write_nand_pages(IPodTouchFMSSState *s)
                                  &w1, sizeof(uint32_t));
 
         uint32_t cs_mask = w0 & 0xF;
-        uint32_t flags   = w0 & ~0xFu;
+        /* The second entry of a two-page program carries extra bits in its
+         * flag word: observed 0x70811001 next to a first entry of 0x00801001,
+         * with a page number one past the first entry's. Requiring an exact
+         * match dropped that page, and each dropped page was a 4 KB hole in
+         * the guest's filesystem that surfaced as corruption on the next boot
+         * (lockdown's data_ark.plist holding preferences.plist content, the
+         * activation screen, an install that "lasts one boot"). Bits 28..30
+         * and bit 16 are therefore ignored when classifying an entry; the
+         * variant is still reported once so it can be checked against the
+         * page numbers it carries. */
+        uint32_t flags   = w0 & ~0xFu & ~FMSS_ENTRY_FLAG_IGNORE;
         bool one_hot     = cs_mask && !(cs_mask & (cs_mask - 1));
         bool is_program  = (flags == FMSS_WRITE_ENTRY_FLAGS);
         bool is_erase    = (flags == FMSS_ERASE_ENTRY_FLAGS);
+        if ((is_program || is_erase) && one_hot && (w0 & FMSS_ENTRY_FLAG_IGNORE)) {
+            static unsigned variant_seen;
+            if (variant_seen < 8) {
+                variant_seen++;
+                warn_report("fmss: program entry %d with variant flags w0=0x%08x "
+                            "page=%u - applied as %s", idx, w0, w1,
+                            is_erase ? "erase" : "program");
+            }
+        }
         if (!(is_program || is_erase) || !one_hot) {
             if (idx > 0 && w0 != 0 && w0 != 0xFFFFFFFFu) {
                 static unsigned cut_seen;
