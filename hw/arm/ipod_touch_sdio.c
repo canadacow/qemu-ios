@@ -30,6 +30,13 @@
 
 static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
                                 uint32_t status, uint32_t flags);
+static void bcm4325_queue_event_full(IPodTouchSDIOState *s, uint32_t event_type,
+                                     uint32_t status, uint32_t flags,
+                                     const uint8_t *addr,
+                                     const void *data, uint32_t datalen);
+static uint32_t bcm4325_fill_iscan_results(uint8_t *out, uint32_t max);
+static void bcm4325_queue(IPodTouchSDIOState *s, GQueue *q,
+                          BCM4325PendingResponse *resp);
 
 /* The one network this device reports; the scan result and the association
  * queries both use it, so they tell the same story. */
@@ -82,6 +89,58 @@ static uint32_t bcm4325_backplane_read(IPodTouchSDIOState *s, uint32_t addr)
 }
 
 
+/* One line per Ethernet frame crossing the NIC: addresses, protocol, ports.
+ * Enough to follow ARP, DHCP, DNS and TCP handshakes without decoding dumps. */
+static void bcm4325_trace_frame(const char *dir, const uint8_t *p, uint32_t n)
+{
+    if (n < 14) { SDTRACE("  %s %u bytes (runt)", dir, n); return; }
+    uint16_t et = (p[12] << 8) | p[13];
+    if (et == 0x0806 && n >= 42) {
+        uint16_t op = (p[20] << 8) | p[21];
+        SDTRACE("  %s ARP %s %u.%u.%u.%u -> %u.%u.%u.%u", dir,
+                op == 1 ? "request" : "reply",
+                p[28], p[29], p[30], p[31], p[38], p[39], p[40], p[41]);
+    } else if (et == 0x0800 && n >= 34) {
+        uint8_t proto = p[23]; uint32_t ihl = (p[14] & 15) * 4, t = 14 + ihl;
+        uint16_t sp = 0, dp = 0;
+        if ((proto == 6 || proto == 17) && n >= t + 4) {
+            sp = (p[t] << 8) | p[t + 1]; dp = (p[t + 2] << 8) | p[t + 3];
+        }
+        SDTRACE("  %s IP %s %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len %u%s", dir,
+                proto == 6 ? "TCP" : proto == 17 ? "UDP" : proto == 1 ? "ICMP" : "?",
+                p[26], p[27], p[28], p[29], sp, p[30], p[31], p[32], p[33], dp, n,
+                (proto == 17 && (sp == 67 || sp == 68)) ? " DHCP" :
+                (proto == 17 && dp == 53) ? " DNS" :
+                (proto == 17 && dp == 5353) ? " mDNS" : "");
+    } else {
+        SDTRACE("  %s ethertype %04x len %u", dir, et, n);
+    }
+}
+
+/* Diagnostic: the guest ARPs for 169.254.255.255 right after its address is
+ * configured and nothing answers, so the datagram behind it is never sent.
+ * Answer with a made-up station so that packet is transmitted and can be
+ * read in the trace. */
+static ssize_t bcm4325_receive(NetClientState *nc, const uint8_t *buf, size_t size);
+static void bcm4325_answer_linklocal_arp(IPodTouchSDIOState *s,
+                                         const uint8_t *p, uint32_t n)
+{
+    static const uint8_t fake_mac[6] = { 0x02, 0x00, 0x5e, 0x10, 0x00, 0x02 };
+    if (n < 42 || p[12] != 0x08 || p[13] != 0x06 || p[21] != 1) { return; }
+    if (!(p[38] == 169 && p[39] == 254 && p[40] == 255 && p[41] == 255)) { return; }
+    uint8_t r[42] = { 0 };
+    memcpy(r, p + 6, 6);            /* to the requester */
+    memcpy(r + 6, fake_mac, 6);
+    r[12] = 0x08; r[13] = 0x06;
+    r[14] = 0; r[15] = 1; r[16] = 8; r[17] = 0; r[18] = 6; r[19] = 4; r[20] = 0; r[21] = 2;
+    memcpy(r + 22, fake_mac, 6);    /* sender: the asked-for address */
+    memcpy(r + 28, p + 38, 4);
+    memcpy(r + 32, p + 6, 6);       /* target: the requester */
+    memcpy(r + 38, p + 28, 4);
+    SDTRACE("  diag: answering ARP for 169.254.255.255");
+    bcm4325_receive(qemu_get_queue(s->nic), r, sizeof(r));
+}
+
 /* ---- CDC control channel ------------------------------------------------
  * Control traffic on function 2 is a length tag, an SDPCM header, then a CDC
  * command header. The device must answer each command with a response whose
@@ -98,6 +157,15 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
     cpu_physical_memory_read(s->baddr, frame, len);
 
 
+    {
+        static unsigned n;
+        if (n++ < 3) {
+            char h[3*32+1]; int j=0;
+            for (uint32_t i = 0; i < len && i < 32; i++)
+                j += snprintf(h+j, sizeof(h)-j, "%02x%s", frame[i], (i==3||i==11)?"|":" ");
+            SDTRACE("  REQUEST %u bytes: %s", len, h);
+        }
+    }
     if (len < SDPCM_HEADER_LEN + sizeof(BCM4325CdcHeader)) {
         return;
     }
@@ -108,12 +176,36 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
 
     /* A data frame is an Ethernet packet the guest is transmitting: hand it
      * to the host network rather than parsing it as a command. */
-    if (sdpcm->channel == SDPCM_DATA_CHANNEL) {
+    if ((sdpcm->channel & 0xf) == SDPCM_DATA_CHANNEL) {
         BCM4325FrameHeaderPacket *tag = (BCM4325FrameHeaderPacket *)frame;
         uint32_t flen = tag->frame_length;
-        if (flen > off && flen <= len && s->nic) {
-            qemu_send_packet(qemu_get_queue(s->nic), frame + off, flen - off);
-            SDTRACE("  tx %u bytes to the network", flen - off);
+        {
+            static unsigned nt;
+            if (nt++ < 3) {
+                char h[3 * 40 + 1]; int j = 0;
+                for (uint32_t i = 0; i < len && i < 40; i++)
+                    j += snprintf(h + j, sizeof(h) - j, "%02x%s", frame[i],
+                                  (i == 3 || i == 11 || i == off - 1) ? "|" : " ");
+                SDTRACE("  TXDATA flen=%u doff=%u: %s", flen, off, h);
+            }
+        }
+        /* The guest prefixes a 4-byte BDC header (flags 0x10, priority, flags2,
+         * data_offset in words) - its own transmit dump shows "10 00 00 00"
+         * followed by the Ethernet frame. That is shorter than the 6 bytes
+         * the driver requires ahead of a received frame, so the two
+         * directions use different offsets. */
+        const BCM4325BdcHeader *bdc = (const BCM4325BdcHeader *)(frame + off);
+        uint32_t eth = off + 4 + 4u * bdc->data_offset;
+        if (flen > eth && flen <= len && s->nic) {
+            NetClientState *nc = qemu_get_queue(s->nic);
+            const uint8_t *pkt = frame + eth;
+            uint32_t plen = flen - eth;
+            ssize_t sent = qemu_send_packet(nc, pkt, plen);
+            bcm4325_trace_frame("tx", pkt, plen);
+            if (sent != (ssize_t)plen) {
+                SDTRACE("  tx: backend took %d of %u bytes", (int)sent, plen);
+            }
+            bcm4325_answer_linklocal_arp(s, pkt, plen);
         } else {
             SDTRACE("  tx dropped: frame_length=%u off=%u len=%u", flen, off, len);
         }
@@ -146,19 +238,25 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
     resp->flags  = cdc->flags;      /* carries the request id the host checks */
     resp->status = 0;               /* success */
 
-    /* Association queries answer with the network the scan reports, so the
-     * two agree. A zeroed BSSID reads as "associated to nothing", which is
-     * the contradiction that drives configd into the Ask To Join panel. */
-    if (cdc->cmd == CDC_CMD_GET_BSSID && resp->payload_len >= 6) {
-        memcpy(resp->payload, bcm4325_bssid, sizeof(bcm4325_bssid));
-    }
 
     /* A scan request is answered with results, but not here: queueing an event
      * straight after the reply puts it in the middle of the command/response
      * cycle, and the driver reads it where it expects the next reply. Note the
      * request and deliver it from the idle poll, when nothing is outstanding. */
+    /* AppleBCM4325ScanManager::startIScan only arms itself for the completion
+     * (bit 1 of its state byte) after our reply to this command has been
+     * processed, so the event must not be queued before that reply is even
+     * collected. Note the request and deliver the event from a later idle
+     * poll. */
     if (cdc->cmd == CDC_CMD_SET_VAR && !strcmp(iovar, "iscan")) {
-        s->scan_pending = true;
+        /* A real scan takes a few hundred milliseconds. Completing it inside
+         * the same interrupt burst as this reply delivers the scan-complete
+         * before the SCAN_REQ ioctl has returned to userland, and Preferences
+         * then never asks for the results: the driver reaches
+         * scanComplete(): success either way, but only the late completion
+         * is followed by getSCAN_RESULT. */
+        timer_mod(s->scan_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + BCM4325_SCAN_MS);
     }
 
     /* The host checks the response's len against the length it sent, so echo
@@ -172,10 +270,59 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
         resp->payload_len = sizeof(resp->payload);
     }
 
+    /* Numeric commands. The queries answer with the one network the scan
+     * reports, so everything the driver reads back agrees. */
+    const uint8_t *req_payload = frame + off + CDC_REQUEST_HEADER_LEN;
+    uint32_t req_avail = len - off - CDC_REQUEST_HEADER_LEN;
+    if (!(cdc->flags & CDC_DCMD_SET)) {
+        uint32_t *w = (uint32_t *)resp->payload;
+        switch (cdc->cmd) {
+        case CDC_CMD_GET_BSSID:                 /* 86: ether_addr */
+            if (resp->payload_len >= 6) {
+                memcpy(resp->payload, bcm4325_bssid, 6);
+            }
+            break;
+        case CDC_CMD_GET_SSID:                  /* 25: wlc_ssid_t */
+            if (resp->payload_len >= 36) {
+                w[0] = strlen(BCM4325_FAKE_SSID);
+                memcpy(resp->payload + 4, BCM4325_FAKE_SSID, w[0]);
+            }
+            break;
+        case CDC_CMD_GET_CHANNEL:               /* 29: channel_info_t */
+            if (resp->payload_len >= 12) {
+                w[0] = w[1] = w[2] = BCM4325_FAKE_CHANNEL;
+            }
+            break;
+        case CDC_CMD_GET_RATE:                  /* 12: 500 kbps units */
+            if (resp->payload_len >= 4) { w[0] = 108; }
+            break;
+        case CDC_CMD_GET_RSSI:                  /* 127 */
+            if (resp->payload_len >= 4) { w[0] = (uint32_t)-40; }
+            break;
+        default:
+            break;
+        }
+    } else if (cdc->cmd == CDC_CMD_SET_SSID && req_avail >= 4) {
+        /* wlc_ssid_t: the join. Answer like the firmware: the command succeeds
+         * at once and the association is reported through events. */
+        uint32_t slen = *(const uint32_t *)req_payload;
+        char ssid[33] = { 0 };
+        if (slen > 32) { slen = 32; }
+        if (req_avail >= 4 + slen) { memcpy(ssid, req_payload + 4, slen); }
+        SDTRACE("  join requested: ssid \"%s\"", ssid);
+        s->associated = false;
+        timer_mod(s->join_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + BCM4325_JOIN_MS);
+    }
+
     /* Answer the queries whose value the driver actually acts on. Everything
      * else still returns zeros, which reads as "feature absent / disabled"
      * and keeps initialisation moving. */
-    if (cdc->cmd == CDC_CMD_GET_VAR && resp->payload_len >= 6 &&
+    if (cdc->cmd == CDC_CMD_GET_VAR && !strcmp(iovar, "iscanresults")) {
+        /* AppleBCM4325ScanManager::handleIScanResult reads status, version,
+         * buflen and count from this buffer and then walks the BSS entries. */
+        bcm4325_fill_iscan_results(resp->payload, sizeof(resp->payload));
+    } else if (cdc->cmd == CDC_CMD_GET_VAR && resp->payload_len >= 6 &&
         (!strcmp(iovar, "cur_etheraddr") || !strcmp(iovar, "perm_etheraddr"))) {
         /* Locally-administered address; the OTP would hold this on real
          * hardware. Without it the interface has no identity and the stack
@@ -188,11 +335,27 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
                  "wl0: emulated BCM4325 (qemu-ios)");
     }
 
+    /* event_msgs carries the bitmask of firmware events the driver wants; a
+     * bit it has not set is one it will ignore on arrival. */
+    if (cdc->cmd == CDC_CMD_SET_VAR && !strcmp(iovar, "event_msgs")) {
+        const uint8_t *m = frame + off + CDC_REQUEST_HEADER_LEN + strlen("event_msgs") + 1;
+        uint32_t avail = len - (off + CDC_REQUEST_HEADER_LEN + (uint32_t)strlen("event_msgs") + 1);
+        char bits[256]; int n = 0;
+        for (uint32_t i = 0; i < avail && i < 16 && n < (int)sizeof(bits) - 8; i++) {
+            for (int b = 0; b < 8; b++) {
+                if (m[i] & (1u << b)) {
+                    n += snprintf(bits + n, sizeof(bits) - n, "%u ", i * 8 + b);
+                }
+            }
+        }
+        SDTRACE("  event_msgs mask (%u bytes) enables events: %s", avail, bits);
+    }
+
     SDTRACE("  CDC cmd=%u %s len=%u id=%u %s", cdc->cmd,
             (cdc->flags & CDC_DCMD_SET) ? "set" : "get",
             cdc->len & 0xFFFF, cdc->flags >> 16, iovar);
 
-    g_queue_push_tail(s->rx_fifo, resp);
+    bcm4325_queue(s, s->rx_fifo, resp);
 
     /* Events are not injected yet. The wire format and the delivery channel
      * are right - sent as data frames they no longer draw "WTF?? Got an event
@@ -202,6 +365,54 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
      * AppleBCM4325CmdManager then fails its cmd/len/transaction-id asserts and
      * blocks, which is the spinner. Association needs the driver to be idle
      * between commands before an event can be delivered safely. */
+}
+
+/* Queue a response and stamp it with the next frame sequence. The sequence
+ * must be fixed here rather than at build time: the host reads every frame
+ * twice, a 12-byte header peek then the body, and both reads have to return
+ * the same bytes. */
+/* Scan timer: the scan requested with "iscan" has finished. */
+static void bcm4325_scan_done(void *opaque)
+{
+    IPodTouchSDIOState *s = opaque;
+    bcm4325_queue_event(s, BRCMF_E_SCAN_COMPLETE, BRCMF_E_STATUS_SUCCESS, 0);
+}
+
+/* Join timer: the association requested with WLC_SET_SSID has completed.
+ * AppleBCM4325's event table routes 3 and 7 to JoinManager::handleAuth and
+ * handleAssoc (status 0, reason 0, addr = BSSID), 0 to handleSetSSID, which
+ * cancels the join watchdog and reports the join with the event's addr as
+ * the BSSID joined, and 16 to NetManager::handleLink, which takes flags bit 0
+ * as link-up and brings the interface up. */
+static void bcm4325_join_done(void *opaque)
+{
+    IPodTouchSDIOState *s = opaque;
+    bcm4325_queue_event_full(s, BRCMF_E_AUTH, 0, 0, bcm4325_bssid, NULL, 0);
+    bcm4325_queue_event_full(s, BRCMF_E_ASSOC, 0, 0, bcm4325_bssid, NULL, 0);
+    bcm4325_queue_event_full(s, BRCMF_E_SET_SSID, 0, 0, bcm4325_bssid, NULL, 0);
+    bcm4325_queue_event_full(s, BRCMF_E_LINK, 0, BRCMF_EVENT_MSG_LINK,
+                             bcm4325_bssid, NULL, 0);
+    s->associated = true;
+}
+
+static void bcm4325_queue(IPodTouchSDIOState *s, GQueue *q,
+                          BCM4325PendingResponse *resp)
+{
+    resp->sequence = s->tx_sequence++;
+    g_queue_push_tail(q, resp);
+
+    /* The host only reads when interrupted, and only a CARD interrupt makes
+     * AppleBCM4325::interruptHandler run: that is status bit 0x2, the cause
+     * the post-command timer raises. Bit 0x1 is transfer-complete, which the
+     * host controller driver ignores outside a transfer - raising it for the
+     * scan-complete event left the driver idle until its own deep-sleep
+     * timer next sent a command, by which time its 1800 ms scan timeout had
+     * expired. A command reply needs nothing here: the write that carried
+     * the command already armed the card interrupt. */
+    if (q == s->event_fifo) {
+        s->irq_reg |= 0x2;
+        qemu_irq_raise(s->irq);
+    }
 }
 
 /* Build the frame the host reads back for a queued control response. */
@@ -214,22 +425,34 @@ static uint32_t bcm4325_build_control_frame(BCM4325PendingResponse *resp,
     if (total > max) { return 0; }
     memset(out, 0, total);
 
+    /* The tag counts the whole frame, itself included: the driver's own
+     * transmit dump shows framlen(38) for 4 + 8 + 12 + 14 bytes, and rxPacket
+     * takes frame_length - 12 (tag + SDPCM) as the body it DMAs. Declaring
+     * total - 4 here made every body 4 bytes short: a SET reply arrived as
+     * "framelen(8): 07 01 00 00 0e 00 00 00", cmd and len with no flags. */
     BCM4325FrameHeaderPacket *tag = (BCM4325FrameHeaderPacket *)out;
     tag->frame_length = total;
     tag->checksum = ~total;
 
     BCM4325SdpcmHeader *sdpcm =
         (BCM4325SdpcmHeader *)(out + sizeof(BCM4325FrameHeaderPacket));
-    sdpcm->channel = resp->channel;
+    sdpcm->channel = resp->channel & 0xf;
     sdpcm->data_offset = SDPCM_HEADER_LEN;
-    sdpcm->max_sequence = 4;      /* credit for further transmissions */
+
+    /* rxPacket keeps byte 9 as the host's transmit credit (stored at +0x39)
+     * and treats byte 8 as flow control - zero there means "clear to send"
+     * (+0x3a). Byte 4 is this frame's sequence, fixed when the response was
+     * queued: the host reads every frame twice, a header peek then the body,
+     * and both reads must return identical bytes. */
+    sdpcm->sequence = resp->sequence;
+    sdpcm->flow_control = 0;
+    sdpcm->credit = (uint8_t)(resp->sequence + 8);
 
     if (resp->channel == SDPCM_CONTROL_CHANNEL) {
         BCM4325CdcHeader *cdc = (BCM4325CdcHeader *)(out + SDPCM_HEADER_LEN);
         cdc->cmd    = resp->cmd;
         cdc->len    = resp->len;
-        cdc->flags  = resp->flags;
-        cdc->status = resp->status;
+        cdc->flags  = resp->flags | (resp->status ? CDC_DCMD_ERROR : 0u);
         if (resp->payload_len) {
             memcpy(out + SDPCM_HEADER_LEN + sizeof(BCM4325CdcHeader),
                    resp->payload, resp->payload_len);
@@ -265,19 +488,60 @@ static void bcm4325_fill_bss(BCM4325BssInfo *bss)
     bss->rateset.rates[1] = 0x84;      /* 2Mbps basic */
     bss->rateset.rates[2] = 0x8b;      /* 5.5Mbps basic */
     bss->rateset.rates[3] = 0x96;      /* 11Mbps basic */
-    bss->chanspec = BCM4325_FAKE_CHANNEL;
+    bss->chanspec = BCM4325_FAKE_CHANSPEC;
+    bss->ctl_ch = BCM4325_FAKE_CHANNEL;
     bss->dtim_period = 1;
-    bss->rssi = (uint16_t)(int16_t)-40; /* a strong signal */
+    bss->rssi = -40;                   /* a strong signal */
     bss->phy_noise = -90;
-    bss->ctl_ch = 6;
+    bss->snr = 50;
     bss->ie_offset = sizeof(*bss);
     bss->ie_length = 0;
-    bss->snr = 50;
 }
 
+/* Fill the buffer an "iscanresults" GET_VAR returns: a status word, then
+ * wl_scan_results with our one network. */
+static uint32_t bcm4325_fill_iscan_results(uint8_t *out, uint32_t max)
+{
+    /* AppleBCM4325BSSBeacon's parser (0xc033ef3c) takes only the BSSID, RSSI
+     * and capability from the fixed fields. The name, the rates and the
+     * channel come from the 802.11 information elements it walks from
+     * bss + ie_offset for ie_length bytes: SSID (0), Supported Rates (1),
+     * DS Parameter Set (3). Without them the beacon has an empty name and
+     * channel 0, and Settings lists nothing. */
+    static const uint8_t ies[] = {
+        0x00, 8, 'q', 'e', 'm', 'u', '-', 'i', 'o', 's',   /* SSID */
+        0x01, 4, 0x82, 0x84, 0x8b, 0x96,                    /* rates 1 2 5.5 11 */
+        0x03, 1, BCM4325_FAKE_CHANNEL,                      /* DS: channel */
+    };
+    BCM4325IscanResults *r = (BCM4325IscanResults *)out;
+    uint32_t entry = sizeof(BCM4325BssInfo) + sizeof(ies);
+    uint32_t total = offsetof(BCM4325IscanResults, results.bss) + entry;
+
+    if (total > max) { return 0; }
+    memset(out, 0, total);
+    r->status = WL_SCAN_RESULTS_SUCCESS;
+    r->results.buflen = sizeof(r->results) - sizeof(r->results.bss) + entry;
+    r->results.version = BCM4325_BSS_VERSION;
+    r->results.count = 1;
+    bcm4325_fill_bss(&r->results.bss[0]);
+    r->results.bss[0].length = entry;
+    r->results.bss[0].ie_offset = sizeof(BCM4325BssInfo);
+    r->results.bss[0].ie_length = sizeof(ies);
+    memcpy((uint8_t *)&r->results.bss[0] + sizeof(BCM4325BssInfo), ies, sizeof(ies));
+    return total;
+}
+
+
+static void bcm4325_queue_event_full(IPodTouchSDIOState *s, uint32_t event_type,
+                                     uint32_t status, uint32_t flags,
+                                     const uint8_t *addr,
+                                     const void *data, uint32_t datalen);
 static void bcm4325_queue_event_data(IPodTouchSDIOState *s, uint32_t event_type,
                                      uint32_t status, uint32_t flags,
-                                     const void *data, uint32_t datalen);
+                                     const void *data, uint32_t datalen)
+{
+    bcm4325_queue_event_full(s, event_type, status, flags, NULL, data, datalen);
+}
 
 static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
                                 uint32_t status, uint32_t flags)
@@ -285,19 +549,28 @@ static void bcm4325_queue_event(IPodTouchSDIOState *s, uint32_t event_type,
     bcm4325_queue_event_data(s, event_type, status, flags, NULL, 0);
 }
 
-static void bcm4325_queue_event_data(IPodTouchSDIOState *s, uint32_t event_type,
+static void bcm4325_queue_event_full(IPodTouchSDIOState *s, uint32_t event_type,
                                      uint32_t status, uint32_t flags,
+                                     const uint8_t *addr,
                                      const void *data, uint32_t datalen)
 {
     BCM4325PendingResponse *resp = g_malloc0(sizeof(*resp));
     const uint8_t *mac = s->conf.macaddr.a;
-    BCM4325EventHeader *ev = (BCM4325EventHeader *)resp->payload;
+    BCM4325BdcHeader *bdc = (BCM4325BdcHeader *)resp->payload;
+    BCM4325EventHeader *ev =
+        (BCM4325EventHeader *)(resp->payload + sizeof(*bdc));
 
     /* Real firmware delivers events to the host as ordinary data frames that
      * the stack recognises by their 0x886C ethertype - not on a separate
      * channel. Marking them as channel 1 makes AppleBCM4325 report "WTF?? Got
      * an event packet!!!" from its data-frame path. */
     resp->channel = SDPCM_DATA_CHANNEL;
+
+    /* handleDataPacket parses the packet from bdc + 4. */
+    bdc->flags = BDC_PROTO_VERSION << BDC_FLAG_VER_SHIFT;
+    bdc->priority = 0;
+    bdc->flags2 = 0;
+    bdc->data_offset = 0;
 
     memcpy(ev->dest, mac, 6);
     memcpy(ev->src, mac, 6);
@@ -313,20 +586,29 @@ static void bcm4325_queue_event_data(IPodTouchSDIOState *s, uint32_t event_type,
     ev->status      = cpu_to_be32(status);
     ev->reason      = 0;
     ev->auth_type   = 0;
-    memcpy(ev->addr, mac, 6);
+    memcpy(ev->addr, addr ? addr : mac, 6);
     g_strlcpy(ev->ifname, "eth0", sizeof(ev->ifname));
     ev->ifidx = 0;
     ev->bsscfgidx = 0;
 
     ev->datalen = cpu_to_be32(datalen);
-    resp->payload_len = sizeof(*ev);
-    if (data && datalen && sizeof(*ev) + datalen <= sizeof(resp->payload)) {
-        memcpy(resp->payload + sizeof(*ev), data, datalen);
+    resp->payload_len = sizeof(*bdc) + sizeof(*ev);
+    {
+        const uint8_t *e = (const uint8_t *)ev;
+        SDTRACE("  EVENT hdr: ethertype=%02x%02x subtype=%02x%02x len=%02x%02x "
+                "ver=%02x oui=%02x%02x%02x usr_subtype=%02x%02x | evtype=%02x%02x%02x%02x",
+                e[12], e[13], e[14], e[15], e[16], e[17], e[18],
+                e[19], e[20], e[21], e[22], e[23],
+                e[28], e[29], e[30], e[31]);
+    }
+    if (data && datalen &&
+        sizeof(*bdc) + sizeof(*ev) + datalen <= sizeof(resp->payload)) {
+        memcpy(resp->payload + sizeof(*bdc) + sizeof(*ev), data, datalen);
         resp->payload_len += datalen;
     }
     SDTRACE("  event type=%u status=%u datalen=%u queued", event_type, status,
             datalen);
-    g_queue_push_tail(s->event_fifo, resp);
+    bcm4325_queue(s, s->event_fifo, resp);
 }
 
 /* A frame arriving from the host network. Hand it to the guest on the data
@@ -336,23 +618,28 @@ static ssize_t bcm4325_receive(NetClientState *nc, const uint8_t *buf,
 {
     IPodTouchSDIOState *s = qemu_get_nic_opaque(nc);
     BCM4325PendingResponse *resp;
+    bcm4325_trace_frame("rx", buf, (uint32_t)size);
 
-    if (size > sizeof(resp->payload)) {
+    if (size + sizeof(BCM4325BdcHeader) > sizeof(resp->payload)) {
         return size;   /* drop oversized frames rather than truncate */
     }
     resp = g_malloc0(sizeof(*resp));
     resp->channel = SDPCM_DATA_CHANNEL;
-    memcpy(resp->payload, buf, size);
-    resp->payload_len = size;
+
+    /* Data-channel frames carry a BDC header ahead of the Ethernet frame. */
+    {
+        BCM4325BdcHeader *bdc = (BCM4325BdcHeader *)resp->payload;
+        bdc->flags = BDC_PROTO_VERSION << BDC_FLAG_VER_SHIFT;
+    }
+    memcpy(resp->payload + sizeof(BCM4325BdcHeader), buf, size);
+    resp->payload_len = size + sizeof(BCM4325BdcHeader);
     SDTRACE("  rx %u bytes from the network: ethertype %02x%02x",
             (unsigned)size, size > 13 ? buf[12] : 0, size > 13 ? buf[13] : 0);
 
     /* Network receive callbacks already run with the big QEMU lock held, so
      * this must not take it again - doing so deadlocks the emulator and the
      * guest then panics with "Unable to communicate with SDIO device". */
-    g_queue_push_tail(s->event_fifo, resp);
-    s->irq_reg |= 0x1;
-    qemu_irq_raise(s->irq);
+    bcm4325_queue(s, s->event_fifo, resp);
     return size;
 }
 
@@ -478,32 +765,11 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
                         g_free(g_queue_pop_head(q));
                     }
                 }
-                /* Idle: nothing is outstanding, so this is the safe moment to
-                 * deliver an unsolicited event. */
-                if (!total && s->scan_pending) {
-                    BCM4325EscanResult r;
-                    s->scan_pending = false;
-                    memset(&r, 0, sizeof(r));
-                    r.buflen = sizeof(r);
-                    r.version = BCM4325_ESCAN_VERSION;
-                    r.sync_id = 1;
-                    r.bss_count = 1;
-                    bcm4325_fill_bss(&r.bss);
-                    /* This driver scans with iscan, the API that predates
-                     * escan, so the completion it waits for is SCAN_COMPLETE
-                     * (26) rather than ESCAN_RESULT (69). */
-                    bcm4325_queue_event_data(s, BRCMF_E_SCAN_COMPLETE,
-                                             BRCMF_E_STATUS_SUCCESS, 0,
-                                             &r, sizeof(r));
-                    if (!g_queue_is_empty(s->event_fifo)) {
-                        BCM4325PendingResponse *ev =
-                            (BCM4325PendingResponse *)g_queue_peek_head(s->event_fifo);
-                        total = bcm4325_build_control_frame(ev, frame, sizeof(frame));
-                        if (total && want >= total) {
-                            g_free(g_queue_pop_head(s->event_fifo));
-                        }
-                    }
-                }
+                /* Nothing left to collect: the command reply has been taken, so
+                 * this is the moment to hand over the scan-complete event. It
+                 * is queued here rather than when the iscan command arrived,
+                 * because the scan manager only arms itself for the completion
+                 * after that reply has been processed. */
                 if (!total) {
                     /* Nothing queued. After collecting a response the host
                      * always polls once more for a follow-on frame; answering
@@ -517,26 +783,84 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
                     BCM4325CdcHeader *dbg =
                         (BCM4325CdcHeader *)(frame + SDPCM_HEADER_LEN);
                     SDTRACE("  F2 read want=%u -> %u bytes  reply cmd=%u len=%u "
-                            "id=%u status=%u", want, total, dbg->cmd, dbg->len,
-                            dbg->flags >> 16, dbg->status);
+                            "id=%u flags=%#x", want, total, dbg->cmd, dbg->len,
+                            dbg->flags >> 16, dbg->flags);
                 } else {
                     SDTRACE("  F2 read want=%u -> %u bytes%s", want, total,
                             total ? "" : " (no frame)");
                 }
-                /* Write the whole length the host asked for, not just the
-                 * frame. A short write leaves the tail of its buffer holding
-                 * the previous response, and it then parses a stale CDC header
-                 * - which is what the driver reports as three failed asserts on
-                 * cmd, len and transaction id. frame[] is zeroed, so the
-                 * padding reads as zeros. */
-                /* Never write more than the host asked for: its 12-byte peek
+
+                /* What the CDC header reads as at each plausible offset, so the
+                 * one the driver's asserts use can be identified from a log. */
+                if (total >= 28) {
+                    static unsigned no;
+                    if (no++ < 3) {
+                        for (int o = 0; o <= 12; o += 4) {
+                            const uint32_t *w = (const uint32_t *)(frame + o);
+                            SDTRACE("    at offset %2d: cmd=%-6u len=%-6u flags=%#010x",
+                                    o, w[0], w[1], w[2]);
+                        }
+                    }
+                }
+
+                /* Data-channel frames: dump what the driver will parse as the
+                 * BDC header and the Ethernet frame behind it. */
+                if (total > 40 && (frame[5] & 0xf) == SDPCM_DATA_CHANNEL) {
+                    static unsigned nd;
+                    if (nd++ < 3) {
+                        char hex[3 * 32 + 1];
+                        int n = 0;
+                        for (uint32_t i = 0; i < total && i < 32; i++) {
+                            n += snprintf(hex + n, sizeof(hex) - n, "%02x%s",
+                                          frame[i],
+                                          (i == 3 || i == 11 || i == 15) ? "|" : " ");
+                        }
+                        SDTRACE("  DATA %u bytes: %s", total, hex);
+                    }
+                }
+
+                /* The exact bytes handed to the driver, for comparison against
+                 * the request frames it sends us. */
+                if (total >= SDPCM_HEADER_LEN + sizeof(BCM4325CdcHeader)) {
+                    static unsigned nf;
+                    if (nf++ < 4) {
+                        char hex[3 * 40 + 1];
+                        int n = 0;
+                        for (uint32_t i = 0; i < total && i < 40; i++) {
+                            n += snprintf(hex + n, sizeof(hex) - n, "%02x%s",
+                                          frame[i], (i == 3 || i == 11) ? "|" : " ");
+                        }
+                        SDTRACE("  REPLY %u bytes: %s", total, hex);
+                    }
+                }
+
+                /* Two reads per frame. The 12-byte peek returns the length tag
+                 * and the SDPCM header. The body fetch is DMA'd by rxPacket
+                 * into an mbuf at offset 0 and sized with mbuf_setlen(framelen
+                 * - 12), for every channel: the CmdManager then takes offset 0
+                 * of that mbuf as the CDC header, and handleDataPacket takes it
+                 * as the BDC header. So the body fetch starts 12 bytes in.
+                 * Serving the whole frame again put the tag where the CDC
+                 * header was expected (every CmdManager assert failed) and the
+                 * CDC header where the payload was expected ("Scan results:
+                 * status(262), version(...), buflen(2024)" - cmd, flags, len). */
+                const uint8_t *out = frame;
+                uint32_t outlen = total;
+                if (want > SDPCM_HEADER_LEN && total > SDPCM_HEADER_LEN) {
+                    out = frame + SDPCM_HEADER_LEN;
+                    outlen = total - SDPCM_HEADER_LEN;
+                }
+
+                /* Never write more than the host asked for: its header peek
                  * buffer is 12 bytes, and overrunning it corrupts guest kernel
-                 * memory - the SDIO controller then wedges with "timed out on
-                 * DMA transaction" and the filesystem is damaged enough to drop
-                 * the device into recovery. Pad with zeros when the frame is
-                 * shorter than the request. */
+                 * memory. frame[] is zeroed, so a short frame pads with zeros. */
                 uint32_t fill = want < sizeof(frame) ? want : sizeof(frame);
-                cpu_physical_memory_write(s->baddr, frame, fill);
+                if (out != frame && fill > outlen) {
+                    /* only the frame's own bytes are meaningful */
+                    cpu_physical_memory_write(s->baddr, out, outlen);
+                } else {
+                    cpu_physical_memory_write(s->baddr, out, fill);
+                }
             }
             
         }
@@ -692,6 +1016,8 @@ static void ipod_touch_sdio_init(Object *obj)
 
     s->rx_fifo = g_queue_new();
     s->event_fifo = g_queue_new();
+    s->scan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bcm4325_scan_done, s);
+    s->join_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bcm4325_join_done, s);
 }
 
 static void ipod_touch_sdio_realize(DeviceState *dev, Error **errp)
