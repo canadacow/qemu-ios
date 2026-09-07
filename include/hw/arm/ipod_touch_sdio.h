@@ -314,6 +314,13 @@ QEMU_BUILD_BUG_ON(offsetof(BCM4325IscanResults, results.bss) != 16);
 #define BCM4325_FAKE_CHANNEL     6
 #define BCM4325_SCAN_MS          400   /* virtual ms from "iscan" to completion */
 #define BCM4325_JOIN_MS          100   /* virtual ms from WLC_SET_SSID to link-up */
+/* Transmit window granted to the host. The driver's outputPacket gate
+ * (AppleBCM4325DeviceInterfaceSdio vtable +0x94) refuses a frame unless
+ * credit - tx_sequence > 1 with both taken from the last frame it received,
+ * so the credit must run ahead of the HOST's sequence, not the model's. It
+ * is refreshed only by frames the host reads, so the window has to cover
+ * every frame the host can send between two command replies. */
+#define BCM4325_TX_WINDOW        32
 /* chanspec as the driver decodes it: band bits 15..12 (0x2000 = 2.4 GHz),
  * bandwidth bits 11..10 (0x800 = 20 MHz), sideband bits 9..8 (0x300 = none),
  * channel in the low byte. */
@@ -361,6 +368,7 @@ typedef struct IPodTouchSDIOState
     NICState *nic;          /* host network backend */
     NICConf conf;
     uint8_t tx_sequence;    /* next frame sequence to hand the host */
+    uint8_t host_sequence;  /* sequence the host will stamp on its next frame */
     QEMUTimer *scan_timer;  /* fires the scan-complete event after "iscan" */
     QEMUTimer *join_timer;  /* fires the association events after WLC_SET_SSID */
     bool associated;

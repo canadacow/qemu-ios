@@ -174,6 +174,14 @@ static void bcm4325_handle_control_write(IPodTouchSDIOState *s, uint32_t len)
         (BCM4325SdpcmHeader *)(frame + sizeof(BCM4325FrameHeaderPacket));
     uint32_t off = sdpcm->data_offset ? sdpcm->data_offset : SDPCM_HEADER_LEN;
 
+    /* Every host frame carries the host's own sequence in byte 4; the credit
+     * advertised back to it is measured from here. Before this the credit
+     * followed the model's sequence, and once the host had sent more frames
+     * than it had received (Safari's DNS queries on top of the driver's own
+     * polling) its window closed and outputPacket dropped every packet with
+     * "Interface can't handle packet". */
+    s->host_sequence = (uint8_t)(sdpcm->sequence + 1);
+
     /* A data frame is an Ethernet packet the guest is transmitting: hand it
      * to the host network rather than parsing it as a command. */
     if ((sdpcm->channel & 0xf) == SDPCM_DATA_CHANNEL) {
@@ -417,6 +425,7 @@ static void bcm4325_queue(IPodTouchSDIOState *s, GQueue *q,
 
 /* Build the frame the host reads back for a queued control response. */
 static uint32_t bcm4325_build_control_frame(BCM4325PendingResponse *resp,
+                                            uint8_t credit,
                                             uint8_t *out, uint32_t max)
 {
     uint32_t total = SDPCM_HEADER_LEN + resp->payload_len +
@@ -443,10 +452,11 @@ static uint32_t bcm4325_build_control_frame(BCM4325PendingResponse *resp,
      * and treats byte 8 as flow control - zero there means "clear to send"
      * (+0x3a). Byte 4 is this frame's sequence, fixed when the response was
      * queued: the host reads every frame twice, a header peek then the body,
-     * and both reads must return identical bytes. */
+     * and both reads must return identical bytes. The credit is the host's
+     * next sequence plus BCM4325_TX_WINDOW, supplied by the caller. */
     sdpcm->sequence = resp->sequence;
     sdpcm->flow_control = 0;
-    sdpcm->credit = (uint8_t)(resp->sequence + 8);
+    sdpcm->credit = credit;
 
     if (resp->channel == SDPCM_CONTROL_CHANNEL) {
         BCM4325CdcHeader *cdc = (BCM4325CdcHeader *)(out + SDPCM_HEADER_LEN);
@@ -758,7 +768,9 @@ void sdio_exec_cmd(IPodTouchSDIOState *s)
                 if (!g_queue_is_empty(q)) {
                     BCM4325PendingResponse *resp =
                         (BCM4325PendingResponse *)g_queue_peek_head(q);
-                    total = bcm4325_build_control_frame(resp, frame, sizeof(frame));
+                    total = bcm4325_build_control_frame(
+                        resp, (uint8_t)(s->host_sequence + BCM4325_TX_WINDOW),
+                        frame, sizeof(frame));
                     /* Only consume it once the host asks for the full frame;
                      * the initial short read is just peeking at the header. */
                     if (total && want >= total) {
